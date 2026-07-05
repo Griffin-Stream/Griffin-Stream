@@ -1,0 +1,35 @@
+Griffin Stream Server - License & Terms
+
+Copyright (c) 2026 Griffin Stream. All rights reserved.
+
+This software (the "Griffin Stream Server") is provided free of charge for use with
+the Griffin Stream Android application to remotely control a Windows PC that you own
+and operate.
+
+1. PERMITTED USE
+   You may install and use this software on computers you own or are authorized to
+   control. You may only connect to it from devices you control.
+
+2. NO WARRANTY
+   THE SOFTWARE IS PROVIDED "AS IS" AND "AS AVAILABLE", WITHOUT WARRANTY OF ANY KIND,
+   EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. YOU USE THE SOFTWARE AT YOUR
+   OWN RISK.
+
+3. LIMITATION OF LIABILITY
+   TO THE MAXIMUM EXTENT PERMITTED BY LAW, THE AUTHORS SHALL NOT BE LIABLE FOR ANY
+   CLAIM, DAMAGES, OR OTHER LIABILITY, INCLUDING ANY LOSS OF DATA, PROFITS, OR HARDWARE,
+   ARISING FROM OR IN CONNECTION WITH THE SOFTWARE OR THE USE OF THE SOFTWARE.
+
+4. SECURITY
+   The server accepts remote input and streams your screen. You are responsible for
+   securing your PC, your network, and your pairing credentials. Only expose the server
+   to networks and devices you trust.
+
+5. THIRD-PARTY COMPONENTS
+   This software bundles FFmpeg (licensed under the LGPL/GPL) for media processing.
+   Virtual gamepad support optionally uses the separately-installed ViGEmBus driver.
+
+By installing or using this software, you agree to these terms.
+
+For more information, visit https://griffinstream.app

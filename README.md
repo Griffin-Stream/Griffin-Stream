@@ -63,6 +63,33 @@ The server is safe to run on your own PC.
 
 **Gamepad support** is optional and requires the [ViGEmBus driver](https://github.com/nefarius/ViGEmBus/releases) (a kernel driver installed separately). Mouse and keyboard work without it.
 
+## 🛠️ Build from source
+
+The Windows server is **open source** — everything that runs on your PC lives in this repo, so you can read, audit, or build it yourself instead of trusting a binary.
+
+```powershell
+cd windows-server
+dotnet publish Server/Server.csproj -c Release -r win-x64 --self-contained
+```
+
+Or build the full branded installer with [Inno Setup 6](https://jrsoftware.org/isdl.php):
+
+```powershell
+.\windows-server\build-release.ps1
+```
+
+> `ffmpeg.exe` isn't committed here — it's fetched by `windows-server/Server/download-ffmpeg.ps1`.
+
+**Repository layout**
+
+| Path | Contents |
+|------|----------|
+| `windows-server/` | Windows server source (.NET) + installer scripts |
+| `shared-protocol/` | Wire protocol shared between the app and server |
+| `assets/` | Branding used on this page |
+
+The Android app source stays private (it's published on Google Play); the **server** is open so you can verify exactly what runs on your own PC.
+
 ## 🔐 Security & privacy
 
 - All remote-control traffic is encrypted with **TLS** and authenticated with a **key pair** — the private key never leaves your device.

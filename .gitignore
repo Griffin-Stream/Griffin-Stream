@@ -24,3 +24,6 @@ Thumbs.db
 .DS_Store
 .vs/
 .idea/
+
+# Third-party binary (fetched via download-ffmpeg.ps1)
+ffmpeg.exe

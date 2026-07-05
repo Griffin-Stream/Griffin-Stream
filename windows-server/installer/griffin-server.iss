@@ -1,0 +1,115 @@
+; Inno Setup script for Griffin Stream Server
+; Build with: iscc griffin-server.iss  (or via windows-server\build-release.ps1)
+;
+; Design notes:
+; - Installs PER-USER into %LOCALAPPDATA%\GriffinStream so the server can write its
+;   runtime files (server.pfx, authorized_keys.txt, password.hash) next to the exe
+;   WITHOUT any code changes and WITHOUT requiring administrator rights.
+; - The optional Windows Firewall rule is the only step that needs elevation; it is
+;   launched separately with a UAC prompt so the main install stays non-elevated.
+
+#define AppName "Griffin Stream Server"
+#define AppPublisher "Griffin Stream"
+#define AppExeName "Server.exe"
+#define AppUrl "https://griffinstream.app"
+; AppVersion can be overridden from the command line: iscc /DAppVersion=1.0.0 ...
+#ifndef AppVersion
+  #define AppVersion "1.0.0"
+#endif
+; SourceDir is the published, self-contained server folder. Override with /DSourceDir=...
+#ifndef SourceDir
+  #define SourceDir "..\..\dist\server"
+#endif
+
+[Setup]
+AppId={{8F3B2E1C-7A4D-4C9E-9B2A-2D6E5C1A9B07}
+AppName={#AppName}
+AppVersion={#AppVersion}
+AppVerName={#AppName} {#AppVersion}
+AppPublisher={#AppPublisher}
+AppPublisherURL={#AppUrl}
+AppSupportURL={#AppUrl}
+AppUpdatesURL={#AppUrl}/download
+AppContact=griffinstream.app@gmail.com
+AppCopyright=Copyright (C) 2026 {#AppPublisher}
+AppComments=Low-latency remote desktop server for the Griffin Stream Android app.
+VersionInfoVersion={#AppVersion}
+VersionInfoCompany={#AppPublisher}
+VersionInfoProductName={#AppName}
+VersionInfoDescription={#AppName} Setup
+VersionInfoCopyright=Copyright (C) 2026 {#AppPublisher}
+DefaultDirName={localappdata}\GriffinStream
+DefaultGroupName=Griffin Stream
+DisableProgramGroupPage=yes
+DisableWelcomePage=no
+PrivilegesRequired=lowest
+OutputDir=..\..\dist
+OutputBaseFilename=GriffinStreamServer-Setup
+Compression=lzma2/max
+SolidCompression=yes
+WizardStyle=modern
+WizardSizePercent=110
+SetupIconFile=griffin.ico
+WizardImageFile=wizard-large.bmp
+WizardSmallImageFile=wizard-small.bmp
+LicenseFile=LICENSE.txt
+UninstallDisplayName={#AppName}
+UninstallDisplayIcon={app}\griffin.ico
+ArchitecturesAllowed=x64compatible
+ArchitecturesInstallIn64BitMode=x64compatible
+MinVersion=10.0
+
+[Languages]
+Name: "english"; MessagesFile: "compiler:Default.isl"
+
+[Tasks]
+Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
+Name: "startup"; Description: "Start Griffin Stream Server automatically when I sign in"; GroupDescription: "Startup:"; Flags: unchecked
+Name: "firewall"; Description: "Add a Windows Firewall rule for TCP port 8888 (requires administrator approval)"; GroupDescription: "Network:"; Flags: unchecked
+
+[Files]
+; Bundles the entire self-contained publish output (Server.exe, .NET runtime, ffmpeg.exe, DLLs).
+Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "griffin.ico"; DestDir: "{app}"; Flags: ignoreversion
+Source: "firewall-allow.ps1"; DestDir: "{app}"; Flags: ignoreversion
+Source: "firewall-remove.ps1"; DestDir: "{app}"; Flags: ignoreversion
+Source: "README-SERVER.txt"; DestDir: "{app}"; Flags: ignoreversion isreadme
+
+[Icons]
+Name: "{group}\Griffin Stream Server"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\griffin.ico"
+Name: "{group}\Griffin Stream Website"; Filename: "{#AppUrl}"
+Name: "{group}\Uninstall Griffin Stream Server"; Filename: "{uninstallexe}"
+Name: "{userdesktop}\Griffin Stream Server"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\griffin.ico"; Tasks: desktopicon
+
+[Registry]
+; Optional per-user autostart (no elevation needed). Removed automatically on uninstall.
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "GriffinStreamServer"; ValueData: """{app}\{#AppExeName}"""; Flags: uninsdeletevalue; Tasks: startup
+
+[Run]
+; Optional: add the firewall rule. Launched elevated via a UAC prompt so the main installer
+; can remain a non-elevated per-user install.
+Filename: "powershell.exe"; \
+  Parameters: "-ExecutionPolicy Bypass -Command ""Start-Process powershell -Verb RunAs -ArgumentList '-ExecutionPolicy Bypass -NoProfile -File \""{app}\firewall-allow.ps1\""'"""; \
+  Flags: runhidden postinstall; Tasks: firewall; Description: "Add Windows Firewall rule"
+Filename: "{app}\{#AppExeName}"; Description: "Launch Griffin Stream Server now"; Flags: nowait postinstall skipifsilent
+
+[UninstallRun]
+; Best-effort removal of the firewall rule on uninstall (elevated prompt).
+Filename: "powershell.exe"; \
+  Parameters: "-ExecutionPolicy Bypass -Command ""Start-Process powershell -Verb RunAs -ArgumentList '-ExecutionPolicy Bypass -NoProfile -File \""{app}\firewall-remove.ps1\""'"""; \
+  Flags: runhidden; RunOnceId: "RemoveGriffinFirewall"
+
+[Code]
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+  begin
+    MsgBox(
+      'Griffin Stream Server installed.' + #13#10#13#10 +
+      'Gamepad support requires the ViGEmBus driver, which is NOT bundled.' + #13#10 +
+      'If you need virtual gamepad input, install it from:' + #13#10 +
+      'https://github.com/nefarius/ViGEmBus/releases' + #13#10#13#10 +
+      'See README-SERVER.txt in the install folder for setup details.',
+      mbInformation, MB_OK);
+  end;
+end;
