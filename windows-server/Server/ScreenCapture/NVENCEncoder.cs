@@ -331,8 +331,10 @@ public class NVENCEncoder : IDisposable
 
         int bufKbps = Math.Max(bitrateKbps / bufDivisor, 1000);
 
+        // Software downscale uses bicubic rather than Lanczos: on the CPU path the scaler competes
+        // with the encoder for cycles, and bicubic is much cheaper for a negligible sharpness loss.
         string scaleFilter = (_outputWidth != _width || _outputHeight != _height)
-            ? $"-vf scale={_outputWidth}:{_outputHeight}:flags=lanczos "
+            ? $"-vf scale={_outputWidth}:{_outputHeight}:flags=bicubic "
             : string.Empty;
 
         string colorFlags = "-color_range pc -colorspace bt709 -color_primaries bt709 -color_trc bt709";
@@ -354,7 +356,6 @@ public class NVENCEncoder : IDisposable
                $"-maxrate {bitrateKbps}k " +
                $"-bufsize {bufKbps}k " +
                $"-g {gopSize} " +
-               $"-forced-idr 1 " +
                $"-flush_packets 1 " +
                $"{colorFlags} " +
                $"-f {outputFormat} " +

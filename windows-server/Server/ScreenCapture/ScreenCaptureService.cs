@@ -151,6 +151,7 @@ public class ScreenCaptureService : IDisposable
     private bool _useNVENC = false;
     private bool _useSoftwareEncoder = false; // libx264/libx265 fallback when NVENC is absent
     private bool _hevcAvailable = false;
+    private int _nvencRestartAttempts = 0; // bounds NVENC restart loops before demoting to software
 
     // Negotiated video config (from client ScreenConfig). Defaults preserve prior behavior
     // but lean toward quality (HEVC off until requested, 15 Mbps base).
@@ -322,6 +323,38 @@ public class ScreenCaptureService : IDisposable
         _useSoftwareEncoder = false;
     }
 
+    /// <summary>
+    /// Step down the encoder after a genuine runtime failure: NVENC -> software libx264/libx265
+    /// -> JPEG. A healthy NVIDIA path never reaches here (it keeps returning valid frames), so
+    /// GPU users are not demoted by normal operation - only by an encoder that actually stops
+    /// producing frames. This also fixes the old behavior where an NVENC failure skipped the good
+    /// software path and dropped straight to slow JPEG.
+    /// </summary>
+    private void DemoteEncoderAfterFailure()
+    {
+        _nvencEncoder?.Dispose();
+        _nvencEncoder = null;
+        _nvencRestartAttempts = 0;
+
+        if (_useNVENC)
+        {
+            _useNVENC = false;
+            _useSoftwareEncoder = DetectSoftwareEncoder();
+            Console.WriteLine(_useSoftwareEncoder
+                ? "[ScreenCapture] NVENC failed at runtime -> switching to software libx264/libx265."
+                : "[ScreenCapture] NVENC failed and no software encoder available -> JPEG fallback.");
+        }
+        else
+        {
+            _useSoftwareEncoder = false;
+            Console.WriteLine("[ScreenCapture] Software FFmpeg encoder failed -> JPEG fallback.");
+        }
+
+        // Force a fresh encoder build on the next frame.
+        _currentEncoderWidth = 0;
+        _currentEncoderHeight = 0;
+    }
+
     /// <summary>Discrete target bitrate (bps): base config + zoom boost or adaptive override.</summary>
     private int ComputeTargetBitrate()
     {
@@ -362,10 +395,24 @@ public class ScreenCaptureService : IDisposable
             scale = (double)targetH / inH;
         }
 
-        if (scale >= 1.0) return (inW, inH); // native / no upscale
+        int outW, outH;
+        if (scale >= 1.0) { outW = inW; outH = inH; } // native / no upscale
+        else
+        {
+            outW = (int)Math.Round(inW * scale);
+            outH = (int)Math.Round(inH * scale);
+        }
 
-        int outW = (int)Math.Round(inW * scale);
-        int outH = (int)Math.Round(inH * scale);
+        // Software (CPU) encoders can't sustain 1080p+ in real time on typical non-NVIDIA PCs.
+        // Cap the software encode to <=1080p so the CPU keeps up (smoother playback and better
+        // perceived quality than a stuttering higher resolution). NVENC is untouched: this only
+        // applies when the hardware path is off and the software path is active.
+        if (!_useNVENC && _useSoftwareEncoder && outH > 1080)
+        {
+            outW = (int)Math.Round(outW * (1080.0 / outH));
+            outH = 1080;
+        }
+
         // yuv420 requires even dimensions
         outW -= outW % 2;
         outH -= outH % 2;
@@ -856,73 +903,94 @@ public class ScreenCaptureService : IDisposable
     {
         try
         {
-            // Check if FFmpeg exists
-            var appDir = AppDomain.CurrentDomain.BaseDirectory;
-            var localPath = System.IO.Path.Combine(appDir, "ffmpeg.exe");
-            if (System.IO.File.Exists(localPath))
+            string? ffmpeg = FindFFmpegPath();
+            if (string.IsNullOrEmpty(ffmpeg)) return false;
+
+            // The FFmpeg build (BtbN GPL) always LISTS h264_nvenc/hevc_nvenc whether or not an
+            // NVIDIA GPU is present, so "-encoders" alone is not proof of hardware. Use it only as
+            // a cheap prerequisite, then run a throwaway encode to confirm the GPU + driver work.
+            // Without this, a non-NVIDIA PC picks NVENC, fails at runtime, and shows a black screen.
+            string encoders = RunFFmpegCapture(ffmpeg, "-hide_banner -encoders");
+            bool listsH264 = encoders.Contains("h264_nvenc", StringComparison.OrdinalIgnoreCase);
+            bool listsHevc = encoders.Contains("hevc_nvenc", StringComparison.OrdinalIgnoreCase);
+            if (!listsH264) return false;
+
+            if (!ProbeEncoder(ffmpeg, "h264_nvenc"))
             {
-                // Try to check if NVENC is supported
-                var startInfo = new System.Diagnostics.ProcessStartInfo
-                {
-                    FileName = localPath,
-                    Arguments = "-encoders",
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    CreateNoWindow = true
-                };
-                var process = System.Diagnostics.Process.Start(startInfo);
-                if (process != null)
-                {
-                    var output = process.StandardOutput.ReadToEnd();
-                    process.WaitForExit();
-                    _hevcAvailable = output.Contains("hevc_nvenc", StringComparison.OrdinalIgnoreCase);
-                    if (_hevcAvailable) Console.WriteLine("[ScreenCapture] hevc_nvenc available");
-                    return output.Contains("h264_nvenc", StringComparison.OrdinalIgnoreCase);
-                }
+                Console.WriteLine("[ScreenCapture] h264_nvenc is in the FFmpeg build but failed a live probe (no usable NVIDIA encoder here) - using software encoder.");
+                return false;
             }
-            
-            // Also check PATH
-            var pathEnv = Environment.GetEnvironmentVariable("PATH");
-            if (!string.IsNullOrEmpty(pathEnv))
-            {
-                foreach (var path in pathEnv.Split(System.IO.Path.PathSeparator))
-                {
-                    var fullPath = System.IO.Path.Combine(path, "ffmpeg.exe");
-                    if (System.IO.File.Exists(fullPath))
-                    {
-                        var startInfo = new System.Diagnostics.ProcessStartInfo
-                        {
-                            FileName = fullPath,
-                            Arguments = "-encoders",
-                            UseShellExecute = false,
-                            RedirectStandardOutput = true,
-                            CreateNoWindow = true
-                        };
-                        var process = System.Diagnostics.Process.Start(startInfo);
-                        if (process != null)
-                        {
-                            var output = process.StandardOutput.ReadToEnd();
-                            process.WaitForExit();
-                            if (output.Contains("hevc_nvenc", StringComparison.OrdinalIgnoreCase))
-                            {
-                                _hevcAvailable = true;
-                                Console.WriteLine("[ScreenCapture] hevc_nvenc available");
-                            }
-                            if (output.Contains("h264_nvenc", StringComparison.OrdinalIgnoreCase))
-                            {
-                                return true;
-                            }
-                        }
-                    }
-                }
-            }
+
+            // NVENC works. Only advertise HEVC if it, too, passes a live probe: some older NVIDIA
+            // cards support H.264 NVENC but not HEVC NVENC.
+            _hevcAvailable = listsHevc && ProbeEncoder(ffmpeg, "hevc_nvenc");
+            if (_hevcAvailable) Console.WriteLine("[ScreenCapture] hevc_nvenc live probe passed");
+            return true;
         }
         catch (Exception ex)
         {
             Console.WriteLine($"NVENC detection error: {ex.Message}");
         }
         return false;
+    }
+
+    /// <summary>Run FFmpeg and return its stdout (used for capability listings like -encoders).</summary>
+    private static string RunFFmpegCapture(string ffmpeg, string args)
+    {
+        try
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = ffmpeg,
+                Arguments = args,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true
+            };
+            using var p = System.Diagnostics.Process.Start(psi);
+            if (p == null) return string.Empty;
+            string outp = p.StandardOutput.ReadToEnd();
+            p.WaitForExit(10000);
+            return outp;
+        }
+        catch { return string.Empty; }
+    }
+
+    /// <summary>
+    /// Live-test an FFmpeg video encoder by encoding a few synthetic frames to a null sink.
+    /// Returns true only when FFmpeg exits cleanly (code 0), i.e. the encoder and any required
+    /// GPU/driver actually work on this machine. This is what distinguishes a real NVENC-capable
+    /// NVIDIA box from one where h264_nvenc is merely compiled into the FFmpeg build.
+    /// </summary>
+    private static bool ProbeEncoder(string ffmpeg, string encoder)
+    {
+        try
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = ffmpeg,
+                Arguments = $"-hide_banner -loglevel error -f lavfi -i color=c=black:s=320x240:r=15:d=1 -c:v {encoder} -pix_fmt yuv420p -f null -",
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true
+            };
+            using var p = System.Diagnostics.Process.Start(psi);
+            if (p == null) return false;
+            // Drain stderr so a full pipe can't block the probe process.
+            _ = p.StandardError.ReadToEnd();
+            if (!p.WaitForExit(10000))
+            {
+                try { p.Kill(true); } catch { }
+                return false;
+            }
+            return p.ExitCode == 0;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     /// <summary>
@@ -1348,7 +1416,9 @@ public class ScreenCaptureService : IDisposable
                         width, height,
                         bitrate: targetBitrate,
                         fps: _cfgFps,
-                        useHevc: _cfgUseHevc,
+                        // Software path forces H.264: libx265 is far too CPU-heavy for real time.
+                        // NVENC HEVC is unaffected (useSoftware is false on the hardware path).
+                        useHevc: _cfgUseHevc && !useSoftware,
                         bitDepth: _cfgBitDepth,
                         qualityMode: _cfgQualityMode,
                         outputWidth: encW,
@@ -1365,29 +1435,36 @@ public class ScreenCaptureService : IDisposable
                 catch (Exception ex)
                 {
                     Console.WriteLine($"[ScreenCapture] Encoder initialization failed: {ex.Message}");
-                    Console.WriteLine("[ScreenCapture] Falling back to PNG/JPEG encoding");
-                    DisableFFmpegEncoder();
+                    DemoteEncoderAfterFailure();
                 }
             }
 
             if (_nvencEncoder != null)
             {
-                // Check if encoder is healthy before using
+                // Check if encoder is healthy before using it. Bound the restart loop so a machine
+                // that can never produce frames (e.g. NVENC that passed the probe but then broke)
+                // demotes to software/JPEG within a couple of seconds instead of staying black.
                 if (!_nvencEncoder.IsHealthy())
                 {
-                    Console.WriteLine("[ScreenCapture] NVENC encoder unhealthy, attempting restart...");
-                    try
+                    _nvencRestartAttempts++;
+                    if (_nvencRestartAttempts > 2)
                     {
-                        _nvencEncoder.ForceRestart();
-                        Console.WriteLine("[ScreenCapture] NVENC encoder restarted successfully");
+                        Console.WriteLine("[ScreenCapture] Encoder still unhealthy after repeated restarts - demoting.");
+                        DemoteEncoderAfterFailure();
                     }
-                    catch (Exception restartEx)
+                    else
                     {
-                        Console.WriteLine($"[ScreenCapture] Encoder restart failed: {restartEx.Message}");
-                        Console.WriteLine("[ScreenCapture] Disabling FFmpeg encoder, falling back to PNG/JPEG");
-                        _nvencEncoder?.Dispose();
-                        _nvencEncoder = null;
-                        DisableFFmpegEncoder();
+                        Console.WriteLine($"[ScreenCapture] NVENC encoder unhealthy, attempting restart ({_nvencRestartAttempts})...");
+                        try
+                        {
+                            _nvencEncoder.ForceRestart();
+                            Console.WriteLine("[ScreenCapture] NVENC encoder restarted successfully");
+                        }
+                        catch (Exception restartEx)
+                        {
+                            Console.WriteLine($"[ScreenCapture] Encoder restart failed: {restartEx.Message}");
+                            DemoteEncoderAfterFailure();
+                        }
                     }
                 }
                 
@@ -1409,7 +1486,9 @@ public class ScreenCaptureService : IDisposable
                             
                             if (nvencEncoded.Length >= 32) // Reduced threshold to 32 bytes to accept tiny P-frames
                             {
-                                // NVENC is working! Hardware accelerated, fast, high quality
+                                // A valid frame means the encoder is healthy; clear the failure bound
+                                // so a working GPU is never demoted by transient earlier hiccups.
+                                _nvencRestartAttempts = 0;
                                 return nvencEncoded;
                             }
                         }
@@ -1432,10 +1511,7 @@ public class ScreenCaptureService : IDisposable
                         }
                         catch
                         {
-                            Console.WriteLine("[ScreenCapture] Disabling FFmpeg encoder, falling back to PNG/JPEG");
-                            _nvencEncoder?.Dispose();
-                            _nvencEncoder = null;
-                            DisableFFmpegEncoder();
+                            DemoteEncoderAfterFailure();
                         }
                     }
                 }
