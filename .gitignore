@@ -1,0 +1,26 @@
+# === Secrets / credentials - NEVER commit ===
+*.pfx
+*.pem
+*.key
+*.p12
+*.jks
+*.keystore
+authorized_keys.txt
+password.hash
+*.env
+secrets*
+
+# === Build output ===
+bin/
+obj/
+dist/
+*.user
+
+# === Private app source (Play Store) ===
+android-app/
+
+# === OS / editor cruft ===
+Thumbs.db
+.DS_Store
+.vs/
+.idea/
