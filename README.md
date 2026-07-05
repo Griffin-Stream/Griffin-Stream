@@ -65,7 +65,7 @@ The server is safe to run on your own PC.
 
 ## 🛠️ Build from source
 
-The Windows server is **open source** — everything that runs on your PC lives in this repo, so you can read, audit, or build it yourself instead of trusting a binary.
+The Windows server is **source-available** — everything that runs on your PC lives in this repo, so you can read, audit, and build it yourself instead of blindly trusting a binary. (See the [license](LICENSE) for usage terms.)
 
 ```powershell
 cd windows-server
@@ -88,7 +88,7 @@ Or build the full branded installer with [Inno Setup 6](https://jrsoftware.org/i
 | `shared-protocol/` | Wire protocol shared between the app and server |
 | `assets/` | Branding used on this page |
 
-The Android app source stays private (it's published on Google Play); the **server** is open so you can verify exactly what runs on your own PC.
+The Android app source stays private (it's published on Google Play); the **server** is source-available so you can verify exactly what runs on your own PC.
 
 ## 🔐 Security & privacy
 

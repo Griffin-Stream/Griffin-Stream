@@ -10,18 +10,26 @@ Windows PC that you own and operate.
    You may install and use the Software on computers you own or are authorized to
    control, and connect to it only from devices you control.
 
-2. NO WARRANTY
+2. SOURCE CODE (SOURCE-AVAILABLE)
+   The source code for the Windows server is published for transparency, security
+   review, and personal use. You may view, audit, and build it for your own use on
+   computers you own. You may NOT redistribute, sublicense, sell, or publish the
+   source code or derivative works, or use it in another product or service, without
+   prior written permission from Griffin Stream. All rights not expressly granted are
+   reserved.
+
+3. NO WARRANTY
    THE SOFTWARE IS PROVIDED "AS IS" AND "AS AVAILABLE", WITHOUT WARRANTY OF ANY KIND,
    EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
    FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. YOU USE THE SOFTWARE AT YOUR
    OWN RISK.
 
-3. LIMITATION OF LIABILITY
+4. LIMITATION OF LIABILITY
    TO THE MAXIMUM EXTENT PERMITTED BY LAW, THE AUTHORS SHALL NOT BE LIABLE FOR ANY
    CLAIM, DAMAGES, OR OTHER LIABILITY, INCLUDING ANY LOSS OF DATA, PROFITS, OR HARDWARE,
    ARISING FROM OR IN CONNECTION WITH THE SOFTWARE OR THE USE OF THE SOFTWARE.
 
-4. SECURITY
+5. SECURITY
    The server accepts remote input and streams your screen. You are responsible for
    securing your PC, your network, and your pairing credentials.
 
