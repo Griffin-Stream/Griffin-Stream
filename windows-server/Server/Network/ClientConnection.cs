@@ -13,6 +13,13 @@ namespace PCRemote.Server.Network;
 
 public class ClientConnection
 {
+    // Raise the system timer resolution to ~1ms while streaming so Task.Delay-based frame
+    // pacing is accurate at 60+ fps (default Windows granularity is ~15ms).
+    [System.Runtime.InteropServices.DllImport("winmm.dll", EntryPoint = "timeBeginPeriod")]
+    private static extern uint TimeBeginPeriod(uint uMilliseconds);
+    [System.Runtime.InteropServices.DllImport("winmm.dll", EntryPoint = "timeEndPeriod")]
+    private static extern uint TimeEndPeriod(uint uMilliseconds);
+
     private readonly TcpClient _client;
     private Stream _stream;
     private readonly ScreenCaptureService _screenCapture;
@@ -21,6 +28,17 @@ public class ClientConnection
     private readonly WasapiAudioCaptureService _audioCapture;
     private ProtocolHandler? _protocolHandler;
     private bool _authenticated = false;
+
+    // Per-connection challenge-response state. The server issues a single-use nonce, then the
+    // client must return a valid ECDSA signature over it before _authenticated flips true.
+    private byte[]? _pendingNonce;
+    private byte[]? _pendingPubKey;
+    private string _pendingLabel = "Device";
+    private bool _pendingIsPairing;
+    private byte[]? _authenticatedPubKey; // enrolled key of this session (for unpair/last-seen)
+
+    private const byte AuthTypeKeyBegin = 0x10;
+    private const byte AuthTypePairBegin = 0x11;
     private readonly SemaphoreSlim _writeSemaphore = new SemaphoreSlim(1, 1); // Serialize all writes to the stream
     private System.Diagnostics.Stopwatch? _streamStopwatch; // Tracks stream start time for A/V sync timestamps
     private CancellationToken _cancellationToken; // Store for use in streaming tasks
@@ -171,11 +189,52 @@ public class ClientConnection
         var lastFrameTime = stopwatch.ElapsedMilliseconds;
         var pendingSends = new List<Task>(); // Local list for thread safety
         bool? lastIdleReported = null; // track active/idle transitions to notify the client
-        
+
+        // Frame pacing: honor the client's requested fps cap. Without pacing the loop runs as
+        // fast as the capture/encode/send pipeline allows (150+ fps), ignoring the negotiated cap
+        // and wasting CPU/GPU/bandwidth.
+        //
+        // We schedule capture on an *absolute* cadence (nextCaptureTicks advances by one frame
+        // budget each iteration) so capture/encode time is absorbed within the budget rather than
+        // added on top of it. The wait is a hybrid: Thread.Sleep(1) (accurate to ~1ms thanks to
+        // timeBeginPeriod(1)) for the bulk, then a short spin for the final ~1.5ms. Plain
+        // Task.Delay snaps to the ~15.6ms scheduler tick, which made 60 fps behave like 30.
+        long freq = System.Diagnostics.Stopwatch.Frequency;
+        long spinMarginTicks = freq / 700; // ~1.4ms spin tail for sub-tick accuracy
+        long nextCaptureTicks = stopwatch.ElapsedTicks;
+
+        TimeBeginPeriod(1);
+        try
+        {
         while (!cancellationToken.IsCancellationRequested && _client.Connected && _authenticated)
         {
             try
             {
+                // Pace to the requested fps cap before capturing a fresh frame to send now.
+                int targetFps = _screenCapture.TargetFps;
+                if (targetFps > 0)
+                {
+                    long budgetTicks = freq / targetFps;
+                    while (!cancellationToken.IsCancellationRequested)
+                    {
+                        long remaining = nextCaptureTicks - stopwatch.ElapsedTicks;
+                        if (remaining <= 0) break;
+                        if (remaining > spinMarginTicks)
+                            System.Threading.Thread.Sleep(1);
+                        else
+                            System.Threading.Thread.SpinWait(80);
+                    }
+                    // Advance to the next slot. If a slow encode/network put us behind schedule,
+                    // resync to now so we don't build up debt and then burst above the cap.
+                    nextCaptureTicks += budgetTicks;
+                    long nowTicks = stopwatch.ElapsedTicks;
+                    if (nextCaptureTicks < nowTicks) nextCaptureTicks = nowTicks;
+                }
+                else
+                {
+                    nextCaptureTicks = stopwatch.ElapsedTicks;
+                }
+
                 // Tell the client when the stream flips between active and idle (static screen),
                 // so its FPS HUD can show a stable "Idle" state instead of a jittery low number.
                 if (_protocolHandler != null)
@@ -251,7 +310,7 @@ public class ClientConnection
                         
                         var sendTask = _protocolHandler.WriteMessageAsync(message, cancellationToken);
                         pendingSends.Add(sendTask);
-                        
+
                         // Clean up finished tasks occasionally to keep list small
                         if (frameCount % 10 == 0)
                         {
@@ -307,6 +366,11 @@ public class ClientConnection
                 CrashLogger.LogCrash("StreamScreenFrames Loop", ex);
                 break;
             }
+        }
+        }
+        finally
+        {
+            TimeEndPeriod(1);
         }
         stopwatch.Stop();
         Console.WriteLine($"Stopped streaming frames. Total frames sent: {frameCount}");
@@ -440,6 +504,12 @@ public class ClientConnection
         {
             case MessageType.AuthRequest:
                 await HandleAuthRequest(message);
+                break;
+            case MessageType.AuthResponse:
+                await HandleAuthResponse(message);
+                break;
+            case MessageType.Unpair:
+                await HandleUnpair();
                 break;
             case MessageType.MouseInput:
                 if (_authenticated)
@@ -605,21 +675,157 @@ public class ClientConnection
 
     private async Task HandleAuthRequest(ProtocolMessage message)
     {
-        var (success, sessionToken) = await _securityManager.AuthenticateClient(message.Data ?? Array.Empty<byte>());
-        _authenticated = success;
-
-        var response = new ProtocolMessage
+        var data = message.Data ?? Array.Empty<byte>();
+        if (data.Length < 1)
         {
-            Type = success ? MessageType.AuthSuccess : MessageType.AuthFailure,
-            Data = sessionToken != null ? System.Text.Encoding.UTF8.GetBytes(sessionToken) : null
-        };
+            await SendAuthFailure();
+            return;
+        }
+
+        byte authType = data[0];
+        byte[]? pubKey;
+        string label = "Device";
+        bool isPairing = false;
+
+        if (authType == AuthTypeKeyBegin)
+        {
+            // [0x10][pubKey] - authenticate an already-enrolled device.
+            pubKey = data.Skip(1).ToArray();
+            if (pubKey.Length == 0 || !_securityManager.IsEnrolled(pubKey))
+            {
+                // Not enrolled: the client treats this failure as "offer pairing".
+                Console.WriteLine($">>> Unrecognized device. Enter PIN {_securityManager.PairingPin} in the app to pair. <<<");
+                await SendAuthFailure();
+                return;
+            }
+        }
+        else if (authType == AuthTypePairBegin)
+        {
+            // [0x11][pinLen][pin][labelLen][label][pubKey] - enroll a new device.
+            if (!TryParsePairBegin(data, out var pin, out label, out pubKey))
+            {
+                await SendAuthFailure();
+                return;
+            }
+            if (!_securityManager.ValidatePin(pin))
+            {
+                await SendAuthFailure();
+                return;
+            }
+            isPairing = true;
+        }
+        else
+        {
+            Console.WriteLine($"Unsupported authentication type: 0x{authType:X2}");
+            await SendAuthFailure();
+            return;
+        }
+
+        // Issue a single-use challenge; the client must sign it with its private key to prove
+        // possession before we authenticate (or, for pairing, before we enroll the key).
+        var nonce = SecurityManager.GenerateNonce();
+        _pendingNonce = nonce;
+        _pendingPubKey = pubKey;
+        _pendingLabel = label;
+        _pendingIsPairing = isPairing;
+
         if (_protocolHandler != null)
         {
-            await _protocolHandler.WriteMessageAsync(response, CancellationToken.None);
+            await _protocolHandler.WriteMessageAsync(new ProtocolMessage
+            {
+                Type = MessageType.AuthChallenge,
+                Data = nonce
+            }, CancellationToken.None);
         }
-        
-        // Start screen capture, cursor position, and audio streaming only after successful authentication
-        if (success)
+    }
+
+    private static bool TryParsePairBegin(byte[] data, out string pin, out string label, out byte[] pubKey)
+    {
+        pin = "";
+        label = "Device";
+        pubKey = Array.Empty<byte>();
+
+        int off = 1; // skip auth type byte
+        if (data.Length < off + 1) return false;
+        int pinLen = data[off++];
+        if (pinLen <= 0 || data.Length < off + pinLen + 1) return false;
+        pin = System.Text.Encoding.ASCII.GetString(data, off, pinLen);
+        off += pinLen;
+
+        int labelLen = data[off++];
+        if (labelLen < 0 || data.Length < off + labelLen) return false;
+        label = labelLen > 0 ? System.Text.Encoding.UTF8.GetString(data, off, labelLen) : "Device";
+        off += labelLen;
+
+        pubKey = data.Skip(off).ToArray();
+        return pubKey.Length > 0;
+    }
+
+    private async Task HandleAuthResponse(ProtocolMessage message)
+    {
+        var signature = message.Data ?? Array.Empty<byte>();
+        var nonce = _pendingNonce;
+        var pubKey = _pendingPubKey;
+        _pendingNonce = null; // single-use, regardless of outcome
+
+        if (nonce == null || pubKey == null || signature.Length == 0 ||
+            !_securityManager.VerifyChallenge(pubKey, nonce, signature))
+        {
+            Console.WriteLine("[Auth] Challenge signature verification failed.");
+            _authenticated = false;
+            await SendAuthFailure();
+            return;
+        }
+
+        if (_pendingIsPairing)
+        {
+            _securityManager.EnrollDevice(pubKey, _pendingLabel);
+        }
+        else
+        {
+            _securityManager.MarkSeen(pubKey);
+        }
+
+        _authenticated = true;
+        _authenticatedPubKey = pubKey;
+
+        if (_protocolHandler != null)
+        {
+            await _protocolHandler.WriteMessageAsync(new ProtocolMessage
+            {
+                Type = MessageType.AuthSuccess
+            }, CancellationToken.None);
+        }
+
+        await StartAuthenticatedSession();
+    }
+
+    private Task HandleUnpair()
+    {
+        // Only an authenticated client may revoke its own enrolled key.
+        if (_authenticated && _authenticatedPubKey != null)
+        {
+            _securityManager.RemoveDevice(_authenticatedPubKey);
+            _authenticatedPubKey = null;
+            Console.WriteLine("[Auth] Client requested unpair; key revoked.");
+        }
+        return Task.CompletedTask;
+    }
+
+    private async Task SendAuthFailure()
+    {
+        if (_protocolHandler != null)
+        {
+            await _protocolHandler.WriteMessageAsync(new ProtocolMessage
+            {
+                Type = MessageType.AuthFailure
+            }, CancellationToken.None);
+        }
+    }
+
+    /// <summary>Begin streaming after a successful challenge-response authentication.</summary>
+    private async Task StartAuthenticatedSession()
+    {
         {
             // Take over as the single active streaming session; end any prior one ("newest wins").
             ClientConnection? previous;

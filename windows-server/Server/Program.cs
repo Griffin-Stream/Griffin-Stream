@@ -77,7 +77,7 @@ class Program
         bool trayMode = args.Any(a => string.Equals(a, "--tray", StringComparison.OrdinalIgnoreCase));
         if (trayMode)
         {
-            TrayIcon.Start(securityManager.PairingPin, port, () =>
+            TrayIcon.Start(securityManager, port, () =>
             {
                 _running = false;
                 _cancellationTokenSource.Cancel();
@@ -125,6 +125,42 @@ class Program
                 // Ignore errors
             }
         });
+
+        // Simple console commands for reviewing/revoking paired devices. Best-effort: skipped when
+        // there is no interactive console (e.g. launched detached).
+        if (!Console.IsInputRedirected)
+        {
+            _ = Task.Run(() =>
+            {
+                Console.WriteLine("Commands: 'devices' to list paired devices, 'remove <n>' to unpair one.");
+                while (_running)
+                {
+                    string? line;
+                    try { line = Console.ReadLine(); }
+                    catch { break; }
+                    if (line == null) break;
+                    line = line.Trim();
+
+                    if (line.Equals("devices", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var devices = securityManager.ListDevices();
+                        if (devices.Count == 0) { Console.WriteLine("No paired devices."); continue; }
+                        for (int i = 0; i < devices.Count; i++)
+                        {
+                            var d = devices[i];
+                            Console.WriteLine($"  [{i}] {d.Label} (paired {d.EnrolledUtc.ToLocalTime():g}, last seen {d.LastSeenUtc.ToLocalTime():g})");
+                        }
+                    }
+                    else if (line.StartsWith("remove ", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (int.TryParse(line.Substring(7).Trim(), out int idx) && securityManager.RemoveDeviceByIndex(idx))
+                            Console.WriteLine($"Removed device [{idx}] (it must pair again to reconnect).");
+                        else
+                            Console.WriteLine("Usage: remove <index shown by 'devices'>");
+                    }
+                }
+            });
+        }
 
         // Handle shutdown
         Console.CancelKeyPress += (sender, e) =>

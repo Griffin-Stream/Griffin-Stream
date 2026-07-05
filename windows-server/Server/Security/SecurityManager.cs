@@ -1,21 +1,41 @@
 using System.Net.Security;
+using System.Security.AccessControl;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
+using System.Security.Principal;
 using System.Text;
+using System.Text.Json;
 
 namespace PCRemote.Server.Security;
+
+/// <summary>
+/// A device enrolled to authenticate against this server. The public key (EC P-256 SPKI DER,
+/// base64) is the identity; the label and timestamps are for the user's "Paired devices" view.
+/// </summary>
+public class EnrolledDevice
+{
+    public string Label { get; set; } = "Device";
+    public string PubKeyB64 { get; set; } = "";
+    public DateTime EnrolledUtc { get; set; } = DateTime.UtcNow;
+    public DateTime LastSeenUtc { get; set; } = DateTime.UtcNow;
+}
 
 public class SecurityManager
 {
     private readonly X509Certificate2 _serverCertificate;
-    private readonly Dictionary<string, byte[]> _authorizedKeys = new();
-    private readonly Dictionary<string, DateTime> _activeSessions = new();
-    private string _authorizedKeysPath = "authorized_keys.txt";
+
+    // Enrolled devices keyed by base64(SHA-256(pubKey DER)) for O(1) lookup.
+    private readonly Dictionary<string, EnrolledDevice> _authorizedKeys = new();
+    private readonly object _keysLock = new();
+
+    // Labeled key store lives beside the executable so its location is stable across launches
+    // regardless of the working directory.
+    private static readonly string StorePath =
+        Path.Combine(AppContext.BaseDirectory, "authorized_keys.json");
 
     /// <summary>
-    /// One-time pairing PIN for this server session. A new, unauthorized device can enroll
-    /// itself by sending this PIN (shown in the server window) instead of the user having to
-    /// paste a public key into authorized_keys.txt by hand.
+    /// One-time pairing PIN for this server session. A new device enrolls by sending this PIN
+    /// (shown in the server window / tray) together with its public key.
     /// </summary>
     public string PairingPin { get; }
 
@@ -28,13 +48,8 @@ public class SecurityManager
 
     public SecurityManager()
     {
-        // Load or create server certificate
         _serverCertificate = LoadOrCreateCertificate();
-        
-        // Load authorized keys (would be from config file)
         LoadAuthorizedKeys();
-
-        // Fresh pairing PIN each time the server starts.
         PairingPin = GeneratePairingPin();
     }
 
@@ -55,15 +70,10 @@ public class SecurityManager
         X509Chain? chain,
         SslPolicyErrors sslPolicyErrors)
     {
-        // Since clientCertificateRequired is false, clients don't need to provide certificates
-        // Accept the connection if no certificate is provided (expected)
         if (certificate == null)
         {
-            Console.WriteLine("Client connected without certificate (expected)");
-            return true; // No client certificate required
+            return true; // No client certificate required (client authenticates via signed challenge).
         }
-        
-        // If a certificate is provided, validate it (for future use with client cert auth)
         bool isValid = sslPolicyErrors == SslPolicyErrors.None;
         if (!isValid)
         {
@@ -72,120 +82,50 @@ public class SecurityManager
         return isValid;
     }
 
-    public async Task<(bool success, string? sessionToken)> AuthenticateClient(byte[] authData)
+    // ---- Challenge-response authentication -------------------------------------------------
+
+    /// <summary>True if the given public key (SPKI DER) is enrolled.</summary>
+    public bool IsEnrolled(byte[] pubKey)
     {
-        // Parse authentication data
-        if (authData.Length < 1) return (false, null);
-
-        var authType = authData[0];
-        bool success;
-        
-        if (authType == 0x01) // Key-based auth (device already enrolled)
-        {
-            success = await AuthenticateWithKey(authData.Skip(1).ToArray());
-        }
-        else if (authType == 0x02) // PIN pairing (enroll a new device)
-        {
-            success = TryPairWithPin(authData.Skip(1).ToArray());
-        }
-        else
-        {
-            Console.WriteLine($"Unsupported authentication type: 0x{authType:X2}");
-            return (false, null);
-        }
-
-        if (success)
-        {
-            var sessionToken = GenerateSessionToken();
-            _activeSessions[sessionToken] = DateTime.UtcNow.AddHours(24); // 24 hour session
-            CleanupExpiredSessions();
-            return (true, sessionToken);
-        }
-
-        return (false, null);
+        var hash = KeyHash(pubKey);
+        lock (_keysLock) return _authorizedKeys.ContainsKey(hash);
     }
 
-    public bool ValidateSession(string sessionToken)
+    /// <summary>Fresh 32-byte single-use nonce for a challenge.</summary>
+    public static byte[] GenerateNonce()
     {
-        if (_activeSessions.TryGetValue(sessionToken, out var expiry))
-        {
-            if (expiry > DateTime.UtcNow)
-            {
-                return true;
-            }
-            else
-            {
-                _activeSessions.Remove(sessionToken);
-            }
-        }
-        return false;
-    }
-
-    private string GenerateSessionToken()
-    {
-        var bytes = new byte[32];
-        using (var rng = System.Security.Cryptography.RandomNumberGenerator.Create())
-        {
-            rng.GetBytes(bytes);
-        }
-        return Convert.ToBase64String(bytes);
-    }
-
-    private void CleanupExpiredSessions()
-    {
-        var expired = _activeSessions
-            .Where(kvp => kvp.Value < DateTime.UtcNow)
-            .Select(kvp => kvp.Key)
-            .ToList();
-        
-        foreach (var token in expired)
-        {
-            _activeSessions.Remove(token);
-        }
-    }
-
-    private Task<bool> AuthenticateWithKey(byte[] keyData)
-    {
-        // Verify client's public key signature
-        // Simplified - would use proper ECDSA/RSA verification
-        Console.WriteLine($"Authenticating with key (received {keyData.Length} bytes)");
-        Console.WriteLine($"Key data (first 50 bytes): {Convert.ToBase64String(keyData.Take(50).ToArray())}...");
-        
-        var keyHash = Convert.ToBase64String(SHA256.HashData(keyData));
-        Console.WriteLine($"Key hash: {keyHash.Substring(0, Math.Min(16, keyHash.Length))}...");
-        Console.WriteLine($"Authorized keys count: {_authorizedKeys.Count}");
-        
-        foreach (var kvp in _authorizedKeys)
-        {
-            if (kvp.Value.SequenceEqual(keyData))
-            {
-                Console.WriteLine("Key match found! Authentication successful.");
-                return Task.FromResult(true);
-            }
-        }
-        
-        Console.WriteLine("Key not found in authorized keys. Authentication failed.");
-        Console.WriteLine($">>> To pair this device, enter PIN {PairingPin} in the app. <<<");
-        return Task.FromResult(false);
-    }
-
-    private static string GeneratePairingPin()
-    {
-        // 6-digit numeric PIN from a cryptographically secure source.
-        Span<byte> bytes = stackalloc byte[4];
-        RandomNumberGenerator.Fill(bytes);
-        int value = BitConverter.ToInt32(bytes) & 0x7FFFFFFF;
-        return (value % 1_000_000).ToString("D6");
+        var nonce = new byte[32];
+        RandomNumberGenerator.Fill(nonce);
+        return nonce;
     }
 
     /// <summary>
-    /// Validate a pairing request: [pinLength][pin ASCII][public key]. On a correct PIN the
-    /// device's public key is enrolled (added to authorized_keys.txt) so future connections
-    /// authenticate silently with key auth.
+    /// Verify a client's ECDSA (SHA256withECDSA, DER-encoded) signature over the challenge nonce
+    /// against the supplied public key. This proves possession of the private key.
     /// </summary>
-    private bool TryPairWithPin(byte[] data)
+    public bool VerifyChallenge(byte[] pubKeySpki, byte[] nonce, byte[] signatureDer)
     {
-        // Reject pairing attempts while locked out from prior wrong PINs (brute-force guard).
+        try
+        {
+            using var ecdsa = ECDsa.Create();
+            ecdsa.ImportSubjectPublicKeyInfo(pubKeySpki, out _);
+            // Android's Signature("SHA256withECDSA") emits an ASN.1/DER (Rfc3279) sequence.
+            return ecdsa.VerifyData(nonce, signatureDer, HashAlgorithmName.SHA256,
+                DSASignatureFormat.Rfc3279DerSequence);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Auth] Signature verification error: {ex.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Validate a pairing PIN with brute-force lockout. Returns true only when the PIN is correct
+    /// and the server is not currently locked out.
+    /// </summary>
+    public bool ValidatePin(string pin)
+    {
         lock (_pinLock)
         {
             if (DateTime.UtcNow < _pinLockoutUntil)
@@ -196,28 +136,7 @@ public class SecurityManager
             }
         }
 
-        if (data.Length < 1)
-        {
-            Console.WriteLine("Pairing failed: malformed request.");
-            return false;
-        }
-
-        int pinLength = data[0];
-        if (pinLength <= 0 || data.Length < 1 + pinLength)
-        {
-            Console.WriteLine("Pairing failed: malformed request.");
-            return false;
-        }
-
-        var pin = System.Text.Encoding.ASCII.GetString(data, 1, pinLength);
-        var keyData = data.Skip(1 + pinLength).ToArray();
-        if (keyData.Length == 0)
-        {
-            Console.WriteLine("Pairing failed: no key supplied.");
-            return false;
-        }
-
-        if (!FixedTimeEquals(pin, PairingPin))
+        if (!FixedTimeEquals(pin ?? "", PairingPin))
         {
             lock (_pinLock)
             {
@@ -241,52 +160,207 @@ public class SecurityManager
             _failedPinAttempts = 0;
             _pinLockoutUntil = DateTime.MinValue;
         }
-        EnrollKey(keyData);
-        Console.WriteLine("Pairing successful: new device enrolled.");
         return true;
     }
 
-    private void EnrollKey(byte[] keyData)
-    {
-        var keyHash = Convert.ToBase64String(SHA256.HashData(keyData));
-        if (_authorizedKeys.ContainsKey(keyHash))
-        {
-            return; // Already enrolled.
-        }
+    // ---- Enrollment / revocation ----------------------------------------------------------
 
-        _authorizedKeys[keyHash] = keyData;
-        try
+    /// <summary>Enroll (or re-label) a device by its public key and persist the store.</summary>
+    public void EnrollDevice(byte[] pubKey, string label)
+    {
+        var hash = KeyHash(pubKey);
+        lock (_keysLock)
         {
-            File.AppendAllText(_authorizedKeysPath, Convert.ToBase64String(keyData) + Environment.NewLine);
-            Console.WriteLine($"Saved new authorized key to {_authorizedKeysPath}");
+            if (_authorizedKeys.TryGetValue(hash, out var existing))
+            {
+                existing.LastSeenUtc = DateTime.UtcNow;
+                if (!string.IsNullOrWhiteSpace(label)) existing.Label = label;
+            }
+            else
+            {
+                _authorizedKeys[hash] = new EnrolledDevice
+                {
+                    Label = string.IsNullOrWhiteSpace(label) ? "Device" : label,
+                    PubKeyB64 = Convert.ToBase64String(pubKey),
+                    EnrolledUtc = DateTime.UtcNow,
+                    LastSeenUtc = DateTime.UtcNow
+                };
+                Console.WriteLine($"Paired new device: {label}");
+            }
+            SaveAuthorizedKeys();
         }
-        catch (Exception ex)
+    }
+
+    /// <summary>Update the last-seen timestamp for an authenticated device.</summary>
+    public void MarkSeen(byte[] pubKey)
+    {
+        var hash = KeyHash(pubKey);
+        lock (_keysLock)
         {
-            // The device is enrolled for this session even if we couldn't persist it.
-            Console.WriteLine($"WARNING: could not persist authorized key to {_authorizedKeysPath}: {ex.Message}");
+            if (_authorizedKeys.TryGetValue(hash, out var d))
+            {
+                d.LastSeenUtc = DateTime.UtcNow;
+                SaveAuthorizedKeys();
+            }
         }
+    }
+
+    /// <summary>Revoke a device by its public key. Returns true if a device was removed.</summary>
+    public bool RemoveDevice(byte[] pubKey)
+    {
+        var hash = KeyHash(pubKey);
+        lock (_keysLock)
+        {
+            if (_authorizedKeys.Remove(hash))
+            {
+                SaveAuthorizedKeys();
+                Console.WriteLine("Device unpaired (key revoked).");
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// <summary>Snapshot of enrolled devices for the "Paired devices" UI.</summary>
+    public IReadOnlyList<EnrolledDevice> ListDevices()
+    {
+        lock (_keysLock)
+        {
+            return _authorizedKeys.Values
+                .OrderBy(d => d.EnrolledUtc)
+                .Select(d => new EnrolledDevice
+                {
+                    Label = d.Label,
+                    PubKeyB64 = d.PubKeyB64,
+                    EnrolledUtc = d.EnrolledUtc,
+                    LastSeenUtc = d.LastSeenUtc
+                })
+                .ToList();
+        }
+    }
+
+    /// <summary>Revoke a device by its index in <see cref="ListDevices"/>. Returns true on success.</summary>
+    public bool RemoveDeviceByIndex(int index)
+    {
+        lock (_keysLock)
+        {
+            var ordered = _authorizedKeys.OrderBy(kvp => kvp.Value.EnrolledUtc).ToList();
+            if (index < 0 || index >= ordered.Count) return false;
+            _authorizedKeys.Remove(ordered[index].Key);
+            SaveAuthorizedKeys();
+            return true;
+        }
+    }
+
+    // ---- Helpers --------------------------------------------------------------------------
+
+    private static string KeyHash(byte[] pubKey) => Convert.ToBase64String(SHA256.HashData(pubKey));
+
+    private static string GeneratePairingPin()
+    {
+        Span<byte> bytes = stackalloc byte[4];
+        RandomNumberGenerator.Fill(bytes);
+        int value = BitConverter.ToInt32(bytes) & 0x7FFFFFFF;
+        return (value % 1_000_000).ToString("D6");
     }
 
     private static bool FixedTimeEquals(string a, string b)
     {
-        var ba = System.Text.Encoding.ASCII.GetBytes(a);
-        var bb = System.Text.Encoding.ASCII.GetBytes(b);
+        var ba = Encoding.ASCII.GetBytes(a);
+        var bb = Encoding.ASCII.GetBytes(b);
         return CryptographicOperations.FixedTimeEquals(ba, bb);
     }
 
-    // Anchor the certificate next to the executable so it stays stable across launches
-    // regardless of the current working directory (a changing cert breaks the client's pin).
+    private void LoadAuthorizedKeys()
+    {
+        // Clean break from the legacy line-based authorized_keys.txt: it is intentionally ignored,
+        // which forces a one-time re-pair onto the hardened challenge-response scheme.
+        try
+        {
+            if (!File.Exists(StorePath))
+            {
+                Console.WriteLine("No paired devices yet. Pair from the app using the PIN below.");
+                return;
+            }
+
+            var json = File.ReadAllText(StorePath);
+            var devices = JsonSerializer.Deserialize<List<EnrolledDevice>>(json) ?? new();
+            foreach (var d in devices)
+            {
+                if (string.IsNullOrWhiteSpace(d.PubKeyB64)) continue;
+                try
+                {
+                    var keyBytes = Convert.FromBase64String(d.PubKeyB64);
+                    _authorizedKeys[KeyHash(keyBytes)] = d;
+                }
+                catch (FormatException) { /* skip corrupt entry */ }
+            }
+            Console.WriteLine($"Loaded {_authorizedKeys.Count} paired device(s).");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"WARNING: could not load {StorePath}: {ex.Message}");
+        }
+    }
+
+    private void SaveAuthorizedKeys()
+    {
+        try
+        {
+            var list = _authorizedKeys.Values.OrderBy(d => d.EnrolledUtc).ToList();
+            var json = JsonSerializer.Serialize(list, new JsonSerializerOptions { WriteIndented = true });
+            File.WriteAllText(StorePath, json);
+            LockDownFile(StorePath);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"WARNING: could not persist {StorePath}: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Restrict the key store to the current user, SYSTEM and Administrators, with inheritance
+    /// disabled - so another local user cannot read enrolled public keys. Best-effort.
+    /// </summary>
+    private static void LockDownFile(string path)
+    {
+        try
+        {
+            var fi = new FileInfo(path);
+            var security = new FileSecurity();
+            security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+
+            var current = WindowsIdentity.GetCurrent().User;
+            if (current != null)
+            {
+                security.AddAccessRule(new FileSystemAccessRule(
+                    current, FileSystemRights.FullControl, AccessControlType.Allow));
+            }
+            security.AddAccessRule(new FileSystemAccessRule(
+                new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null),
+                FileSystemRights.FullControl, AccessControlType.Allow));
+            security.AddAccessRule(new FileSystemAccessRule(
+                new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null),
+                FileSystemRights.FullControl, AccessControlType.Allow));
+
+            fi.SetAccessControl(security);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Auth] Could not lock down key store ACL: {ex.Message}");
+        }
+    }
+
+    // ---- Server certificate ---------------------------------------------------------------
+
     private static readonly string CertPath = Path.Combine(AppContext.BaseDirectory, "server.pfx");
     private const string CertPassword = "password";
 
-    // Windows' TLS stack (Schannel) cannot perform server authentication with an ephemeral
-    // (in-memory) private key, so the certificate must be loaded with a PERSISTED key set.
     private const X509KeyStorageFlags CertFlags =
         X509KeyStorageFlags.PersistKeySet | X509KeyStorageFlags.Exportable;
 
     private X509Certificate2 LoadOrCreateCertificate()
     {
-        // Try to load existing certificate with a persisted key set.
         try
         {
             if (File.Exists(CertPath))
@@ -321,12 +395,10 @@ public class SecurityManager
                 X509KeyUsageFlags.DigitalSignature | X509KeyUsageFlags.KeyEncipherment,
                 false));
 
-        // The certificate produced here has an EPHEMERAL private key, which Schannel rejects.
         using var ephemeral = request.CreateSelfSigned(
             DateTimeOffset.UtcNow.AddDays(-1),
             DateTimeOffset.UtcNow.AddYears(1));
 
-        // Export to PFX and re-import with a persisted key set so it's usable for TLS server auth.
         var pfxBytes = ephemeral.Export(X509ContentType.Pkcs12, CertPassword);
         try
         {
@@ -338,62 +410,5 @@ public class SecurityManager
         }
 
         return new X509Certificate2(pfxBytes, CertPassword, CertFlags);
-    }
-
-    private void LoadAuthorizedKeys()
-    {
-        // Try multiple locations: current working directory first (where dotnet run is executed),
-        // then source directory (where .csproj is)
-        var cwdKeysPath = Path.Combine(Directory.GetCurrentDirectory(), "authorized_keys.txt");
-        var appDir = AppDomain.CurrentDomain.BaseDirectory;
-        var sourceKeysPath = Path.Combine(
-            Path.GetDirectoryName(Path.GetDirectoryName(Path.GetDirectoryName(appDir))) ?? appDir,
-            "authorized_keys.txt");
-        
-        string? keysPath = null;
-        if (File.Exists(cwdKeysPath))
-        {
-            keysPath = cwdKeysPath;
-            Console.WriteLine($"Found authorized_keys.txt in current directory: {cwdKeysPath}");
-        }
-        else if (File.Exists(sourceKeysPath))
-        {
-            keysPath = sourceKeysPath;
-            Console.WriteLine($"Found authorized_keys.txt in source directory: {sourceKeysPath}");
-        }
-        
-        // Remember where to persist newly paired keys. If no file exists yet, default to the
-        // current working directory so pairing can create one.
-        _authorizedKeysPath = keysPath ?? cwdKeysPath;
-
-        if (keysPath != null && File.Exists(keysPath))
-        {
-            var keys = File.ReadAllLines(keysPath);
-            int keyCount = 0;
-            foreach (var key in keys)
-            {
-                var trimmedKey = key.Trim();
-                if (string.IsNullOrWhiteSpace(trimmedKey)) continue; // Skip empty lines
-                
-                try
-                {
-                    var keyBytes = Convert.FromBase64String(trimmedKey);
-                    var keyHash = Convert.ToBase64String(SHA256.HashData(keyBytes));
-                    _authorizedKeys[keyHash] = keyBytes;
-                    keyCount++;
-                    Console.WriteLine($"Loaded authorized key #{keyCount} (hash: {keyHash.Substring(0, Math.Min(16, keyHash.Length))}...)");
-                }
-                catch (FormatException ex)
-                {
-                    Console.WriteLine($"WARNING: Failed to parse key on line {keyCount + 1}: {ex.Message}");
-                    Console.WriteLine($"Key preview: {trimmedKey.Substring(0, Math.Min(50, trimmedKey.Length))}...");
-                }
-            }
-            Console.WriteLine($"Loaded {keyCount} authorized key(s)");
-        }
-        else
-        {
-            Console.WriteLine("WARNING: authorized_keys.txt not found. Key-based authentication will not work.");
-        }
     }
 }

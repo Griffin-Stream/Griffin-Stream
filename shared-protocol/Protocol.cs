@@ -6,6 +6,9 @@ public enum MessageType : byte
     AuthRequest = 0x01,
     AuthSuccess = 0x02,
     AuthFailure = 0x03,
+    AuthChallenge = 0x04,   // Server -> client: random nonce for challenge-response auth
+    AuthResponse = 0x05,    // Client -> server: ECDSA signature over the nonce
+    Unpair = 0x06,          // Client -> server (authenticated): revoke this device's enrolled key
     
     // Screen streaming
     ScreenFrame = 0x10,

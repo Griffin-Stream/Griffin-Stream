@@ -59,8 +59,7 @@ public class NVENCEncoder : IDisposable
         // Software encoding is CPU-bound, so keep it at 8-bit to protect frame rate.
         _bitDepth = (bitDepth == 10 && useHevc && !useSoftware) ? 10 : 8;
         _qualityMode = qualityMode;
-        
-        // Try to find FFmpeg
+
         _ffmpegPath = FindFFmpeg();
         if (string.IsNullOrEmpty(_ffmpegPath))
         {
@@ -71,7 +70,6 @@ public class NVENCEncoder : IDisposable
 
     private string FindFFmpeg()
     {
-        // Check if ffmpeg.exe is in the application directory
         var appDir = AppDomain.CurrentDomain.BaseDirectory;
         var localPath = Path.Combine(appDir, "ffmpeg.exe");
         if (File.Exists(localPath))
@@ -79,7 +77,6 @@ public class NVENCEncoder : IDisposable
             return localPath;
         }
 
-        // Check PATH
         var pathEnv = Environment.GetEnvironmentVariable("PATH");
         if (!string.IsNullOrEmpty(pathEnv))
         {
@@ -109,7 +106,6 @@ public class NVENCEncoder : IDisposable
         {
             try
             {
-                // Start FFmpeg process with NVENC encoding
                 var startInfo = new ProcessStartInfo
                 {
                     FileName = _ffmpegPath,
@@ -130,7 +126,6 @@ public class NVENCEncoder : IDisposable
                 _inputStream = _ffmpegProcess.StandardInput.BaseStream;
                 _outputStream = _ffmpegProcess.StandardOutput.BaseStream;
 
-                // Start thread to read encoded frames
                 _readThread = new Thread(ReadEncodedFrames)
                 {
                     IsBackground = true,
@@ -139,7 +134,6 @@ public class NVENCEncoder : IDisposable
                 };
                 _readThread.Start();
 
-                // Read stderr in background to catch errors
                 _ffmpegProcess.BeginErrorReadLine();
                 var errorBuffer = new System.Text.StringBuilder();
                 _ffmpegProcess.ErrorDataReceived += (sender, e) =>
@@ -156,7 +150,7 @@ public class NVENCEncoder : IDisposable
                 };
 
                 _initialized = true;
-                _framesProcessed = 0; // Reset frame counter
+                _framesProcessed = 0;
                 string backend = _useSoftware ? (_useHevc ? "libx265 (SW)" : "libx264 (SW)") : (_useHevc ? "HEVC (NVENC)" : "H.264 (NVENC)");
                 Console.WriteLine($"[Encoder] Initialized: {backend} {_bitDepth}-bit {_width}x{_height} @ {_fps} FPS, {_bitrate / 1000000} Mbps, qualityMode={_qualityMode}");
             }
@@ -169,7 +163,7 @@ public class NVENCEncoder : IDisposable
                 throw;
             }
             
-            // Wait a moment and check if FFmpeg process is still running
+            // FFmpeg validates args on startup; if it bailed immediately, surface that as a failure.
             Thread.Sleep(100);
             if (_ffmpegProcess != null && _ffmpegProcess.HasExited)
             {
@@ -188,10 +182,8 @@ public class NVENCEncoder : IDisposable
             return BuildSoftwareFFmpegArguments();
         }
 
-        // FFmpeg command for NVENC encoding.
-        // Input: raw BGRA video from stdin (NVENC handles GPU color conversion natively).
-        // Output: H.264 or HEVC NAL units (Annex B) to stdout.
-        var bitrateKbps = _bitrate / 1000; // Convert to kbps for FFmpeg
+        // Raw BGRA in on stdin -> H.264/HEVC Annex-B NAL units out on stdout.
+        var bitrateKbps = _bitrate / 1000;
 
         string encoder = _useHevc ? "hevc_nvenc" : "h264_nvenc";
         string outputFormat = _useHevc ? "hevc" : "h264";
@@ -218,25 +210,16 @@ public class NVENCEncoder : IDisposable
             profile = "high"; // High profile is compatible with mobile H.264 decoders
         }
 
-        // Common low-latency flags for all modes:
-        // -delay 0: Output frames immediately (no encoder delay)
-        // -zerolatency 1: Enable zero-latency mode
-        // -bf 0: No B-frames (B-frames require future frames + decoder reordering, adding delay)
-        // -rc-lookahead 0: No lookahead (lookahead buffers frames, adding delay)
-        // -flush_packets 1: Flush output after each packet (critical for pipe output!)
-        // -forced-idr 1: Force IDR frames for instant stream start/recovery
+        // Zero-latency: no encoder delay, no B-frames/lookahead (both add reorder latency),
+        // flush every packet (required for pipe output), and allow on-demand IDR frames.
         var zeroLatencyFlags = "-delay 0 -zerolatency 1 -bf 0 -rc-lookahead 0 -flush_packets 1 -forced-idr 1";
 
-        // Long GOP (~5s). The transport is reliable/in-order (TCP), so periodic keyframes
-        // aren't needed for loss recovery -- they only waste bitrate re-sending full frames.
-        // A long GOP puts those bits into actual detail. -forced-idr still lets us emit an
-        // IDR on demand (stream start, resolution/codec change).
+        // Long GOP (~5s): TCP is lossless, so frequent keyframes would only waste bitrate.
+        // -forced-idr still emits an IDR on demand (stream start, resolution/codec change).
         int gopSize = Math.Max(_fps * 5, 60);
 
-        // Quality mode -> preset / CQ / VBV buffer / AQ. Lower CQ = higher quality.
-        // HEVC CQ values run a few points higher than H.264 for equivalent quality.
-        // aqStrength steers bits toward high-detail regions (text/UI edges); higher for
-        // the quality-first modes where crispness matters more than absolute latency.
+        // Quality mode -> preset / CQ / VBV buffer / AQ. Lower CQ = higher quality (HEVC runs a
+        // few points higher than H.264). aq-strength steers bits toward detail (text/UI edges).
         string preset;
         string tune;
         int cq;
@@ -273,6 +256,10 @@ public class NVENCEncoder : IDisposable
 
         int bufKbps = Math.Max(bitrateKbps / bufDivisor, 1000);
 
+        // maxrate ceiling: 2x for the quality-first modes (they run on strong LANs), 1.5x for
+        // Performance/Balanced so bursts don't spike a shared Wi-Fi link.
+        int maxrateKbps = _qualityMode >= QualityHigh ? bitrateKbps * 2 : bitrateKbps * 3 / 2;
+
         // Optional downscale to the requested output resolution (only when smaller than capture).
         // Lanczos keeps text/UI edges sharper than bicubic when scaling down for the phone.
         string scaleFilter = (_outputWidth != _width || _outputHeight != _height)
@@ -294,7 +281,7 @@ public class NVENCEncoder : IDisposable
                $"-rc vbr " +
                $"-cq {cq} " +
                $"-b:v {bitrateKbps}k " +
-               $"-maxrate {bitrateKbps * 2}k " +
+               $"-maxrate {maxrateKbps}k " +
                $"-bufsize {bufKbps}k " +
                $"-g {gopSize} " +
                $"-spatial-aq 1 " +
@@ -388,7 +375,6 @@ public class NVENCEncoder : IDisposable
             return null;
         }
 
-            // Check if FFmpeg process has crashed
         if (_ffmpegProcess == null || _ffmpegProcess.HasExited)
         {
             Console.WriteLine("[NVENC] FFmpeg process has exited unexpectedly!");
@@ -396,28 +382,23 @@ public class NVENCEncoder : IDisposable
             return null;
         }
 
-        // LATENCY REDUCTION: If encoder is backing up (>1 frame), drop this input frame
-        // and just return what's already in the queue to catch up.
-        // Keeping 1 frame in queue allows for smoothness (jitter buffer), but >1 means we're lagging.
-        // WARMUP: Disable dropping for first 30 frames to ensure stream establishment (IDR, etc.)
+        // If the encode queue is backing up (>1 frame) we're lagging: drop this input and return a
+        // queued frame to catch up. Skipped during warmup so the stream can establish (IDR/SPS).
         bool isWarmup = _framesProcessed < 30;
-        
+
         if (!isWarmup && _encodedFrames.Count > 1)
         {
-            // Try to return the oldest frame to keep the stream moving
             if (_encodedFrames.TryDequeue(out var oldestFrame))
             {
                 Console.WriteLine($"[NVENC] Dropping input to reduce latency (queue size: {_encodedFrames.Count + 1})");
-                
-                // If it's a real frame (not just headers), return it
-                if (oldestFrame.Length >= 32) 
+
+                if (oldestFrame.Length >= 32)
                 {
                     _consecutiveNullFrames = 0;
                     return oldestFrame;
                 }
             }
-            // If we dropped input but didn't get a valid frame, return EMPTY to skip this frame
-            // Returning null would trigger JPEG fallback which is slow
+            // Empty (not null): skip this frame without triggering the slow JPEG fallback.
             return Array.Empty<byte>();
         }
 
@@ -426,37 +407,30 @@ public class NVENCEncoder : IDisposable
             _framesProcessed++;
             try
             {
-                // Write raw frame to FFmpeg stdin with timeout to prevent hanging
-                // If FFmpeg's buffers are full (slow encoding), we skip this frame
-                // WARMUP: Allow longer timeout (500ms) for first few frames to let FFmpeg spin up
+                // Write timeout guards against hanging when FFmpeg's input buffer is full; a
+                // longer budget during warmup lets FFmpeg spin up.
                 int writeTimeoutMs = isWarmup ? 500 : 50;
-                
+
                 var writeTask = Task.Run(() =>
                 {
                     try
                     {
-                        // PERFORMANCE OPTIMIZATION: Write BGRA directly to FFmpeg
-                        // NVENC handles BGRA→YUV420 conversion in GPU hardware (zero CPU cost)
-                        // Previous: CPU pixel-by-pixel conversion took 5-15ms @ 1080p
-                        
-                        // Convert from stride-aligned to packed format if needed
-                        // Desktop Duplication uses BGRA (4 bytes/pixel), GDI uses BGR (3 bytes/pixel)
-                        int bytesPerPixel = stride / width; // Auto-detect: 3 for BGR, 4 for BGRA
-                        
+                        // Write BGRA straight to FFmpeg; NVENC does BGRA->YUV420 on the GPU.
+                        // stride/width auto-detects the source: 4 = BGRA (DXGI), 3 = BGR (GDI).
+                        int bytesPerPixel = stride / width;
+
                         if (bytesPerPixel == 4)
                         {
-                            // 32-bit BGRA from Desktop Duplication - perfect for FFmpeg BGRA input!
                             if (stride == width * 4)
                             {
-                                // Already packed, write directly (zero-copy best case)
-                                // CRITICAL FIX: Write only the actual data size, not the full buffer capacity!
-                                // The buffer might be larger than needed if we switched from a higher resolution.
+                                // Packed already: write only the live data, not leftover buffer
+                                // capacity from a previously higher resolution.
                                 int actualDataSize = width * height * 4;
                                 _inputStream!.Write(rawFrame, 0, actualDataSize);
                             }
                             else
                             {
-                                // Stride padding - pack rows (still much faster than pixel conversion)
+                                // Stride padding: pack row by row.
                                 var rowSize = width * 4;
                                 for (int y = 0; y < height; y++)
                                 {
@@ -467,33 +441,27 @@ public class NVENCEncoder : IDisposable
                         }
                         else if (bytesPerPixel == 3)
                         {
-                            // 24-bit BGR from GDI - need to expand to BGRA for FFmpeg
-                            // Add alpha channel (0xFF for opaque)
-                            var rowSize = width * 4; // BGRA output
+                            // GDI gives 24-bit BGR; expand to BGRA (opaque alpha) for FFmpeg.
+                            var rowSize = width * 4;
                             var bgraRow = new byte[rowSize];
-                            
+
                             for (int y = 0; y < height; y++)
                             {
                                 var srcOffset = y * stride;
-                                
-                                // Convert BGR to BGRA by adding alpha channel
                                 for (int x = 0; x < width; x++)
                                 {
-                                    var srcPixel = srcOffset + (x * 3); // BGR = 3 bytes per pixel
-                                    var dstPixel = x * 4; // BGRA = 4 bytes per pixel
-                                    
-                                    bgraRow[dstPixel + 0] = rawFrame[srcPixel + 0]; // B
-                                    bgraRow[dstPixel + 1] = rawFrame[srcPixel + 1]; // G
-                                    bgraRow[dstPixel + 2] = rawFrame[srcPixel + 2]; // R
-                                    bgraRow[dstPixel + 3] = 0xFF; // A (opaque)
+                                    var srcPixel = srcOffset + (x * 3);
+                                    var dstPixel = x * 4;
+                                    bgraRow[dstPixel + 0] = rawFrame[srcPixel + 0];
+                                    bgraRow[dstPixel + 1] = rawFrame[srcPixel + 1];
+                                    bgraRow[dstPixel + 2] = rawFrame[srcPixel + 2];
+                                    bgraRow[dstPixel + 3] = 0xFF;
                                 }
-                                
                                 _inputStream!.Write(bgraRow, 0, rowSize);
                             }
                         }
                         else
                         {
-                            // Unexpected format - log warning and try direct write
                             Console.WriteLine($"[NVENC] WARNING: Unexpected bytes per pixel: {bytesPerPixel}, attempting direct write");
                             _inputStream!.Write(rawFrame, 0, Math.Min(rawFrame.Length, width * height * 4));
                         }
@@ -506,7 +474,6 @@ public class NVENCEncoder : IDisposable
                     }
                 });
 
-                // Wait for write to complete (resilience against jitter)
                 if (!writeTask.Wait(writeTimeoutMs))
                 {
                     Console.WriteLine($"[NVENC] Write timeout ({writeTimeoutMs}ms) - FFmpeg too slow, skipping frame");
@@ -521,32 +488,27 @@ public class NVENCEncoder : IDisposable
                     return null; // Fatal error, allow fallback/reset
                 }
 
-                // Wait for encoding with high-precision timing
-                // Combine small NAL units (SPS, PPS, SEI) with the next video frame
+                // Collect encoded output, prepending any small NAL units (SPS/PPS/SEI) to the next
+                // video frame. Spin briefly for precision, then yield.
                 var waitStart = System.Diagnostics.Stopwatch.StartNew();
-                const int SPIN_WAIT_MS = 2;    // Spin-wait for first 2ms (high precision)
-                // WARMUP: Allow longer read wait (100ms) for first few frames
-                int maxWaitMs = isWarmup ? 100 : 30; // Max wait 30ms total (~33 FPS min) normally
-                const int MIN_FRAME_SIZE = 32; // Minimum size for actual video frames (static P-frames can be tiny)
-                
-                // Reuse a thread-local or pooled buffer would be ideal, but for now just prevent resizing
-                // Allocating 256KB initial capacity covers most frames without resizing
-                var combinedFrame = new List<byte>(256 * 1024); 
+                const int SPIN_WAIT_MS = 2;
+                int maxWaitMs = isWarmup ? 100 : 30;
+                const int MIN_FRAME_SIZE = 32; // small NALs are headers; >= this is a real frame
+                var combinedFrame = new List<byte>(256 * 1024); // preallocate to avoid resizing
                 
                 while (waitStart.ElapsedMilliseconds < maxWaitMs)
                 {
                     if (_encodedFrames.TryDequeue(out var encodedFrame))
                     {
                         combinedFrame.AddRange(encodedFrame);
-                        
-                        // If this NAL unit is large enough, it's an actual video frame
-                        // Return the combined frame (headers + video data)
+
+                        // A large NAL is the video frame: return headers + frame together.
                         if (encodedFrame.Length >= MIN_FRAME_SIZE)
                         {
                             _consecutiveNullFrames = 0;
                             return combinedFrame.ToArray();
                         }
-                        // Small NAL unit (SPS, PPS, SEI) - keep it and continue to get video frame
+                        // Small NAL (header): keep it and wait for the video frame.
                         continue;
                     }
                     
@@ -560,14 +522,12 @@ public class NVENCEncoder : IDisposable
                     }
                 }
 
-                // Timeout waiting for frame - return EMPTY to skip frame
-                // DO NOT return null, as that triggers slow JPEG fallback
+                // Timed out: skip this frame (empty, not null, to avoid the slow JPEG fallback).
                 _consecutiveNullFrames++;
                 return Array.Empty<byte>();
             }
             catch (IOException ioEx)
             {
-                // Pipe broken - FFmpeg has likely crashed
                 Console.WriteLine($"[NVENC] Pipe error (FFmpeg crashed?): {ioEx.Message}");
                 _consecutiveNullFrames = MAX_CONSECUTIVE_NULL_FRAMES; // Mark as unhealthy
                 return null;
@@ -585,10 +545,9 @@ public class NVENCEncoder : IDisposable
     {
         if (_outputStream == null) return;
 
-        // PERFORMANCE: Use buffer pooling to eliminate GC pressure from allocations
-        var buffer = _bufferPool.Rent(1024 * 1024); // Rent 1MB buffer from pool
+        var buffer = _bufferPool.Rent(1024 * 1024); // pooled to avoid GC churn
         var frameBuffer = new List<byte>();
-        var nalStartPattern = new byte[] { 0x00, 0x00, 0x00, 0x01 }; // NAL unit start code
+        var nalStartPattern = new byte[] { 0x00, 0x00, 0x00, 0x01 }; // Annex-B start code
         int totalBytesRead = 0;
         int totalFrames = 0;
 
@@ -613,27 +572,24 @@ public class NVENCEncoder : IDisposable
 
                 frameBuffer.AddRange(buffer.Take(bytesRead));
 
-                // Extract NAL units (H.264 frames)
-                // Buffer small NAL units (SPS, PPS, SEI) and combine with video frames
+                // Split the stream into NAL units; buffer header NALs (SPS/PPS/SEI) and attach
+                // them to the following video frame.
                 int searchStart = 0;
                 while (true)
                 {
                     int nalStart = FindPattern(frameBuffer, nalStartPattern, searchStart);
                     if (nalStart == -1) break;
 
-                    // Find next NAL unit start
                     int nextNalStart = FindPattern(frameBuffer, nalStartPattern, nalStart + 4);
                     if (nextNalStart == -1)
                     {
-                        // Last NAL unit, wait for more data
+                        // Incomplete trailing NAL: wait for more data.
                         break;
                     }
 
-                    // Extract NAL unit
                     var nalUnit = frameBuffer.Skip(nalStart).Take(nextNalStart - nalStart).ToArray();
-                    
-                    // Get NAL unit type (5 bits after start code)
-                    int nalTypeOffset = nalStart + 4; // After 00 00 00 01
+
+                    int nalTypeOffset = nalStart + 4;
                     if (nalTypeOffset < frameBuffer.Count)
                     {
                         bool isHeader;
@@ -658,7 +614,6 @@ public class NVENCEncoder : IDisposable
                         
                         if (isHeader)
                         {
-                            // Buffer header NAL units, don't send separately
                             _pendingHeaders.AddRange(nalUnit);
                             if (totalFrames <= 10)
                             {
@@ -667,7 +622,6 @@ public class NVENCEncoder : IDisposable
                         }
                         else if (isVideoFrame)
                         {
-                            // Combine any pending headers with this video frame
                             byte[] frameToSend;
                             if (_pendingHeaders.Count > 0)
                             {
@@ -754,8 +708,7 @@ public class NVENCEncoder : IDisposable
 
     public void SetBitrate(int bitrate)
     {
-        // Note: Changing bitrate requires restarting FFmpeg
-        // For now, just log it
+        // Bitrate changes require an encoder restart; the caller rebuilds instead of calling this.
         Console.WriteLine($"Bitrate change requested: {bitrate} (requires encoder restart)");
     }
 
@@ -782,8 +735,7 @@ public class NVENCEncoder : IDisposable
     public void ForceRestart()
     {
         Console.WriteLine("[NVENC] Force restarting encoder...");
-        
-        // Dispose existing resources
+
         _disposed = true;
         _inputStream?.Close();
         _outputStream?.Close();
@@ -804,17 +756,13 @@ public class NVENCEncoder : IDisposable
         _readThread = null;
         _inputStream = null;
         _outputStream = null;
-        
-        // Clear queues
-        // Clear any pending frames
+
         while (_encodedFrames.TryDequeue(out _)) { }
-        
-        // Reset state
+
         _initialized = false;
         _disposed = false;
         _consecutiveNullFrames = 0;
-        
-        // Reinitialize
+
         Initialize();
     }
 

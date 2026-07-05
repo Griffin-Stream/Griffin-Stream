@@ -26,7 +26,92 @@ public class ScreenCaptureService : IDisposable
     
     [DllImport("user32.dll")]
     private static extern IntPtr CopyIcon(IntPtr hIcon);
-    
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern bool EnumDisplaySettings(string? lpszDeviceName, int iModeNum, ref DEVMODE lpDevMode);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern bool EnumDisplayDevices(string? lpDevice, uint iDevNum, ref DISPLAY_DEVICE lpDisplayDevice, uint dwFlags);
+
+    private const int ENUM_CURRENT_SETTINGS = -1;
+    private const int DISPLAY_DEVICE_ATTACHED_TO_DESKTOP = 0x1;
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct DEVMODE
+    {
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmDeviceName;
+        public ushort dmSpecVersion;
+        public ushort dmDriverVersion;
+        public ushort dmSize;
+        public ushort dmDriverExtra;
+        public uint dmFields;
+        public int dmPositionX;
+        public int dmPositionY;
+        public uint dmDisplayOrientation;
+        public uint dmDisplayFixedOutput;
+        public short dmColor;
+        public short dmDuplex;
+        public short dmYResolution;
+        public short dmTTOption;
+        public short dmCollate;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmFormName;
+        public ushort dmLogPixels;
+        public uint dmBitsPerPel;
+        public uint dmPelsWidth;
+        public uint dmPelsHeight;
+        public uint dmDisplayFlags;
+        public uint dmDisplayFrequency;
+        public uint dmICMMethod;
+        public uint dmICMIntent;
+        public uint dmMediaType;
+        public uint dmDitherType;
+        public uint dmReserved1;
+        public uint dmReserved2;
+        public uint dmPanningWidth;
+        public uint dmPanningHeight;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct DISPLAY_DEVICE
+    {
+        public int cb;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string DeviceName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceString;
+        public int StateFlags;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceID;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceKey;
+    }
+
+    /// <summary>
+    /// Highest current refresh rate (Hz) across all attached displays, or 0 if it can't be read.
+    /// Used to cap the requested fps: DXGI duplication can't produce frames faster than the
+    /// physical panel refreshes, so asking for more just wastes pacing cycles.
+    /// </summary>
+    private static int GetMaxDisplayRefreshHz()
+    {
+        int max = 0;
+        try
+        {
+            var dd = new DISPLAY_DEVICE { cb = Marshal.SizeOf<DISPLAY_DEVICE>() };
+            uint i = 0;
+            while (EnumDisplayDevices(null, i, ref dd, 0))
+            {
+                if ((dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) != 0)
+                {
+                    var dm = new DEVMODE { dmSize = (ushort)Marshal.SizeOf<DEVMODE>() };
+                    if (EnumDisplaySettings(dd.DeviceName, ENUM_CURRENT_SETTINGS, ref dm) && dm.dmDisplayFrequency > 1)
+                    {
+                        max = Math.Max(max, (int)dm.dmDisplayFrequency);
+                    }
+                }
+                dd.cb = Marshal.SizeOf<DISPLAY_DEVICE>();
+                i++;
+            }
+        }
+        catch { }
+        return max;
+    }
+
     private const int CURSOR_SHOWING = 0x00000001;
     private const uint DI_NORMAL = 0x0003;
     
@@ -161,6 +246,14 @@ public class ScreenCaptureService : IDisposable
             _cfgBitDepth = bitDepth;
             _cfgQualityMode = qualityMode;
             _cfgFps = fpsCap > 0 ? fpsCap : 120;
+            // DXGI can't capture faster than the panel refreshes; cap so pacing targets a rate we
+            // can actually hit (e.g. 120 requested on a 60 Hz monitor becomes 60).
+            int refreshHz = GetMaxDisplayRefreshHz();
+            if (refreshHz > 1 && _cfgFps > refreshHz)
+            {
+                Console.WriteLine($"[ScreenCapture] Requested {_cfgFps} fps exceeds display refresh; capping to {refreshHz} Hz");
+                _cfgFps = refreshHz;
+            }
             _cfgBaseBitrateBps = bitrateKbps > 0 ? bitrateKbps * 1000 : 15000000;
             _cfgResolutionMode = resolutionMode;
             _cfgTargetWidth = targetWidth;
@@ -172,6 +265,13 @@ public class ScreenCaptureService : IDisposable
         }
         Console.WriteLine($"[ScreenCapture] Video config: codec={(_cfgUseHevc ? "HEVC" : "H264")}, {bitDepth}-bit, quality={qualityMode}, fps={_cfgFps}, bitrate={(bitrateKbps > 0 ? bitrateKbps + "kbps" : "auto")}, resMode={resolutionMode}, target={targetWidth}x{targetHeight}" + (useHevc && !_hevcAvailable ? " (HEVC requested but unavailable -> H264)" : ""));
     }
+
+    /// <summary>
+    /// The client-requested frame-rate cap (frames per second). The streaming loop uses this
+    /// to pace how often it sends frames, so the negotiated fps is actually honored instead of
+    /// running as fast as the capture/encode pipeline allows.
+    /// </summary>
+    public int TargetFps => _cfgFps;
 
     // Guards so adaptive changes can't thrash the encoder (each rebuild is a brief glitch).
     private DateTime _lastRuntimeBitrateApply = DateTime.MinValue;
@@ -248,6 +348,14 @@ public class ScreenCaptureService : IDisposable
         {
             // Match device: fit within the device resolution, never upscale.
             scale = Math.Min((double)_cfgTargetWidth / inW, (double)_cfgTargetHeight / inH);
+        }
+        else if (_cfgResolutionMode == 0 && _cfgTargetWidth > 0 && _cfgTargetHeight > 0)
+        {
+            // Native: allow up to ~1.5x the client's own resolution for supersampled crispness,
+            // but cap there so a high-res desktop (e.g. 4K) doesn't waste bitrate sending far more
+            // pixels than a phone panel can resolve. Never upscale.
+            double cap = Math.Min(1.5 * _cfgTargetWidth / inW, 1.5 * _cfgTargetHeight / inH);
+            if (cap < 1.0) scale = cap;
         }
         else if (targetH > 0 && inH > targetH)
         {
@@ -1343,10 +1451,11 @@ public class ScreenCaptureService : IDisposable
             }  // End of encodeLock scope
         }
 
-        // Fallback to Software Encoding (JPEG/H264)
+        // Fallback to Software Encoding (JPEG/H264). Honor the negotiated fps/bitrate instead of
+        // hardcoded values so the fallback path respects the client's settings too.
         if (_encoder == null)
         {
-            _encoder = new H264Encoder(width, height, bitrate: 10000000, fps: 120);
+            _encoder = new H264Encoder(width, height, bitrate: ComputeTargetBitrate(), fps: _cfgFps);
             _encoder.Initialize();
         }
         return _encoder.EncodeFrame(frameData, width, height, stride);

@@ -16,14 +16,18 @@ obj/
 dist/
 *.user
 
-# === Private app source (Play Store) ===
+# === Private - NOT part of the source-available server ===
 android-app/
+docs/
+website/
+play-assets/
+THIRD_PARTY_NOTICES.md
+
+# === Third-party binary (fetched via download-ffmpeg.ps1) ===
+ffmpeg.exe
 
 # === OS / editor cruft ===
 Thumbs.db
 .DS_Store
 .vs/
 .idea/
-
-# Third-party binary (fetched via download-ffmpeg.ps1)
-ffmpeg.exe
