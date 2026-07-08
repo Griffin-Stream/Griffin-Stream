@@ -73,6 +73,14 @@ class Program
         var discoveryResponder = new DiscoveryResponder(port);
         discoveryResponder.Start();
 
+        // Show the pairing PIN + connection address in a clear, always-on-top window so users don't
+        // have to hunt for the PIN in the scrolling console. Opt out with --no-window (e.g. headless).
+        bool showWindow = !args.Any(a => string.Equals(a, "--no-window", StringComparison.OrdinalIgnoreCase));
+        if (showWindow)
+        {
+            PinWindow.Start(securityManager, port);
+        }
+
         // Optional system-tray presence (run minimized with a quick Exit). Enable with --tray.
         bool trayMode = args.Any(a => string.Equals(a, "--tray", StringComparison.OrdinalIgnoreCase));
         if (trayMode)
@@ -96,7 +104,10 @@ class Program
             {
                 await Task.Delay(1000, _cancellationTokenSource.Token); // Wait a bit for network
                 var localIP = PortForwardingHelper.GetLocalIPAddress();
-                
+
+                // Fill in the real address on the PIN window now that we know the local IP.
+                PinWindow.SetLocalIp(localIP?.ToString(), port);
+
                 Console.WriteLine($"\n=== Connection Information ===");
                 if (localIP != null)
                 {

@@ -21,9 +21,9 @@
     <Company>Griffin Stream</Company>
     <Authors>Griffin Stream</Authors>
     <Copyright>Copyright (c) 2026 Griffin Stream. All Rights Reserved.</Copyright>
-    <Version>1.0.0</Version>
-    <FileVersion>1.0.0.0</FileVersion>
-    <AssemblyVersion>1.0.0.0</AssemblyVersion>
+    <Version>1.1.0</Version>
+    <FileVersion>1.1.0.0</FileVersion>
+    <AssemblyVersion>1.1.0.0</AssemblyVersion>
     <!-- Ahead-of-time compile for faster startup; safe with self-contained publish. -->
     <PublishReadyToRun>true</PublishReadyToRun>
   </PropertyGroup>
