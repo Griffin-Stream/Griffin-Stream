@@ -38,6 +38,7 @@ public enum MessageType : byte
     MonitorSelect = 0x43,    // Client selects which monitor(s) to capture
     MonitorInfo = 0x44,      // Server sends monitor information to client
     StreamState = 0x45,      // Server tells client if the video is active or idle (static). Data: 1 byte (0=active, 1=idle)
+    ServerInfo = 0x46,       // Server -> client (after auth): server tier (Free/Pro), capabilities, server/protocol version
     
     // Wake-on-LAN
     WOLRequest = 0x50,  // Client requests server to send WOL packet
@@ -95,8 +96,63 @@ public class ScreenConfigData
     public ushort TargetHeight { get; set; } = 0;
 }
 
+/// <summary>
+/// Sent by the server right after authentication (<see cref="MessageType.ServerInfo"/>) to tell the
+/// client whether it is a Free or Pro server, plus server/protocol version for compatibility nudges.
+/// Fixed 8-byte layout. Older servers never send this, in which case the client assumes Free tier and
+/// falls back to legacy (client-side) behavior. Deserialization is tolerant so the layout can grow.
+/// </summary>
+public class ServerInfoData
+{
+    public const int Size = 8;
+
+    public const byte TierFree = 0;
+    public const byte TierPro = 1;
+
+    public byte MessageVersion { get; set; } = 1;
+    public byte Tier { get; set; } = TierFree;
+    public byte ProCapabilities { get; set; } = 0;   // reserved for future per-feature flags
+    public byte VersionMajor { get; set; } = 0;
+    public byte VersionMinor { get; set; } = 0;
+    public byte VersionPatch { get; set; } = 0;
+    public byte ProtocolVersion { get; set; } = 1;   // bump when the app/server wire contract changes
+    public byte Reserved { get; set; } = 0;
+}
+
 public static class ProtocolSerializer
 {
+    public static byte[] SerializeServerInfo(ServerInfoData info)
+    {
+        var data = new byte[ServerInfoData.Size];
+        data[0] = info.MessageVersion;
+        data[1] = info.Tier;
+        data[2] = info.ProCapabilities;
+        data[3] = info.VersionMajor;
+        data[4] = info.VersionMinor;
+        data[5] = info.VersionPatch;
+        data[6] = info.ProtocolVersion;
+        data[7] = info.Reserved;
+        return data;
+    }
+
+    public static ServerInfoData DeserializeServerInfo(byte[] data)
+    {
+        // Tolerant: require at least version + tier; default anything beyond that.
+        if (data.Length < 2) throw new ArgumentException("Invalid server info data");
+        var info = new ServerInfoData
+        {
+            MessageVersion = data[0],
+            Tier = data[1],
+        };
+        if (data.Length > 2) info.ProCapabilities = data[2];
+        if (data.Length > 3) info.VersionMajor = data[3];
+        if (data.Length > 4) info.VersionMinor = data[4];
+        if (data.Length > 5) info.VersionPatch = data[5];
+        if (data.Length > 6) info.ProtocolVersion = data[6];
+        if (data.Length > 7) info.Reserved = data[7];
+        return info;
+    }
+
     public static byte[] SerializeMouseInput(int x, int y, byte buttons, short wheelDelta = 0)
     {
         var data = new byte[11];

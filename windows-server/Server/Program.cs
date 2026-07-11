@@ -3,6 +3,9 @@ using PCRemote.Server.ScreenCapture;
 using PCRemote.Server.Input;
 using PCRemote.Server.Security;
 using PCRemote.Server.AudioCapture;
+using PCRemote.Server.Licensing;
+using PCRemote.Server.Logging;
+using PCRemote.Server.Update;
 using System.Net;
 using System.Net.Sockets;
 
@@ -24,6 +27,11 @@ class Program
 
     static async Task Main(string[] args)
     {
+        // Route all console output to a rolling log file + in-memory buffer so the GUI's
+        // "Show debug log" toggle can attach a terminal and replay history on demand. This
+        // must run before the first Console.WriteLine so nothing is missed.
+        ConsoleTee.Install();
+
         Console.WriteLine("PC Remote Server Starting...");
         Console.WriteLine("Press Ctrl+C to stop the server.");
 
@@ -63,6 +71,20 @@ class Program
         // Initialize WASAPI audio capture (native Windows, no VB-Cable required)
         var audioCapture = new WasapiAudioCaptureService();
 
+        // Resolve the Free/Pro tier (BETA_FREE_PRO flag, or a cached/online-validated license) before
+        // any client connects. Keep an active client's tier in sync if a license is activated at runtime.
+        await LicenseManager.InitializeAsync();
+        LicenseManager.TierChanged += _ => ClientConnection.ResendServerInfoToActive();
+        Console.WriteLine($"[License] Server tier: {LicenseManager.CurrentTier} ({LicenseManager.StatusText})");
+
+        // Headless activation for --no-window installs: --license <key>. GUI users use the Activate Pro box.
+        var licenseArgIdx = Array.FindIndex(args, a => string.Equals(a, "--license", StringComparison.OrdinalIgnoreCase));
+        if (licenseArgIdx >= 0 && licenseArgIdx + 1 < args.Length)
+        {
+            var (_, licMsg) = await LicenseManager.ActivateAsync(args[licenseArgIdx + 1]);
+            Console.WriteLine($"[License] {licMsg}");
+        }
+
         // Start server
         const int port = 8888;
         _listener = new TcpListener(IPAddress.Any, port);
@@ -78,8 +100,13 @@ class Program
         bool showWindow = !args.Any(a => string.Equals(a, "--no-window", StringComparison.OrdinalIgnoreCase));
         if (showWindow)
         {
-            PinWindow.Start(securityManager, port);
+            // Closing the dashboard stops the server (users can minimize to keep it running).
+            ServerDashboard.Start(securityManager, port, RequestShutdown);
         }
+
+        // Best-effort check for a newer release. The GUI surfaces an "Update available" affordance
+        // via Updater.UpdateFound; this never blocks startup and is silent when offline/up to date.
+        _ = Updater.CheckAsync();
 
         // Optional system-tray presence (run minimized with a quick Exit). Enable with --tray.
         bool trayMode = args.Any(a => string.Equals(a, "--tray", StringComparison.OrdinalIgnoreCase));
@@ -105,8 +132,8 @@ class Program
                 await Task.Delay(1000, _cancellationTokenSource.Token); // Wait a bit for network
                 var localIP = PortForwardingHelper.GetLocalIPAddress();
 
-                // Fill in the real address on the PIN window now that we know the local IP.
-                PinWindow.SetLocalIp(localIP?.ToString(), port);
+                // Fill in the real address on the dashboard now that we know the local IP.
+                ServerDashboard.SetLocalIp(localIP?.ToString(), port);
 
                 Console.WriteLine($"\n=== Connection Information ===");
                 if (localIP != null)
@@ -137,19 +164,32 @@ class Program
             }
         });
 
-        // Simple console commands for reviewing/revoking paired devices. Best-effort: skipped when
-        // there is no interactive console (e.g. launched detached).
-        if (!Console.IsInputRedirected)
-        {
-            _ = Task.Run(() =>
+        // Simple console commands for reviewing/revoking paired devices. Only active while the
+        // debug terminal is attached (WinExe has no console by default). When the terminal is
+        // hidden we idle instead of busy-looping on a dead stdin.
+        _ = Task.Run(() =>
             {
-                Console.WriteLine("Commands: 'devices' to list paired devices, 'remove <n>' to unpair one.");
+                bool announced = false;
                 while (_running)
                 {
+                    if (!ConsoleTee.IsConsoleVisible)
+                    {
+                        announced = false;
+                        Thread.Sleep(400);
+                        continue;
+                    }
+                    if (!announced)
+                    {
+                        Console.WriteLine("Commands: 'devices' to list paired devices, 'remove <n>' to unpair one.");
+                        announced = true;
+                    }
+
                     string? line;
                     try { line = Console.ReadLine(); }
-                    catch { break; }
-                    if (line == null) break;
+                    catch { Thread.Sleep(400); continue; }
+                    // Null means the console was detached (Show debug log toggled off) - keep the
+                    // server running and wait for it to come back rather than exiting the loop.
+                    if (line == null) { Thread.Sleep(400); continue; }
                     line = line.Trim();
 
                     if (line.Equals("devices", StringComparison.OrdinalIgnoreCase))
@@ -171,7 +211,6 @@ class Program
                     }
                 }
             });
-        }
 
         // Handle shutdown
         Console.CancelKeyPress += (sender, e) =>
@@ -249,6 +288,16 @@ class Program
         screenCapture.Dispose();
         audioCapture.Dispose();
         Console.WriteLine("Server stopped.");
+    }
+
+    /// <summary>Gracefully stop the server and exit the process. Invoked when the dashboard closes.</summary>
+    private static void RequestShutdown()
+    {
+        _running = false;
+        try { _cancellationTokenSource.Cancel(); } catch { /* ignore */ }
+        try { _listener?.Stop(); } catch { /* ignore */ }
+        Console.WriteLine("Dashboard closed — stopping server.");
+        Environment.Exit(0);
     }
 
     private static async Task HandleClient(

@@ -63,9 +63,11 @@ MinVersion=10.0
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
-Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
-Name: "startup"; Description: "Start Griffin Stream Server automatically when I sign in"; GroupDescription: "Startup:"; Flags: unchecked
-Name: "firewall"; Description: "Add a Windows Firewall rule for TCP port 8888 (requires administrator approval)"; GroupDescription: "Network:"; Flags: unchecked
+; All tasks below are OPTIONAL and unchecked by default. The server runs fine without any of them;
+; enable only what you need.
+Name: "desktopicon"; Description: "Create a desktop shortcut (optional)"; GroupDescription: "Optional shortcuts:"; Flags: unchecked
+Name: "startup"; Description: "Start Griffin Stream Server automatically when I sign in (optional)"; GroupDescription: "Optional startup:"; Flags: unchecked
+Name: "firewall"; Description: "Open Windows Firewall for TCP port 8888 — optional, only needed to accept connections from other devices (requires administrator approval)"; GroupDescription: "Optional network access:"; Flags: unchecked
 
 [Files]
 ; Bundles the entire self-contained publish output (Server.exe, .NET runtime, ffmpeg.exe, DLLs).
@@ -99,6 +101,13 @@ Filename: "powershell.exe"; \
   Parameters: "-ExecutionPolicy Bypass -Command ""Start-Process powershell -Verb RunAs -ArgumentList '-ExecutionPolicy Bypass -NoProfile -File \""{app}\firewall-remove.ps1\""'"""; \
   Flags: runhidden; RunOnceId: "RemoveGriffinFirewall"
 
+[UninstallDelete]
+; Remove runtime-generated leftovers the installer doesn't track. User data (paired devices +
+; license) is handled separately by the uninstall prompt in [Code] below.
+Type: filesandordirs; Name: "{app}\logs"
+Type: files; Name: "{app}\crash_log.txt"
+Type: dirifempty; Name: "{app}"
+
 [Code]
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
@@ -111,5 +120,25 @@ begin
       'https://github.com/nefarius/ViGEmBus/releases' + #13#10#13#10 +
       'See README-SERVER.txt in the install folder for setup details.',
       mbInformation, MB_OK);
+  end;
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  // Offer a full clean wipe. The ViGEmBus gamepad driver is a separate, shared kernel driver we
+  // never installed, so it is intentionally left in place (removing it could break other apps).
+  if CurUninstallStep = usUninstall then
+  begin
+    if MsgBox(
+      'Also remove your paired devices and Pro license from this PC?' + #13#10#13#10 +
+      'Choose No if you plan to reinstall and want to keep your pairings and license.',
+      mbConfirmation, MB_YESNO) = IDYES then
+    begin
+      DeleteFile(ExpandConstant('{app}\server.pfx'));
+      DeleteFile(ExpandConstant('{app}\authorized_keys.txt'));
+      DeleteFile(ExpandConstant('{app}\password.hash'));
+      // License cache lives in the Roaming profile, not the install folder.
+      DelTree(ExpandConstant('{userappdata}\GriffinStream'), True, True, True);
+    end;
   end;
 end;

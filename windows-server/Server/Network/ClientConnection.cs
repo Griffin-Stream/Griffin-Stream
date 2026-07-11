@@ -8,6 +8,7 @@ using PCRemote.Server.WOL;
 using PCRemote.Server.AudioCapture;
 using PCRemote.Shared.Protocol;
 using PCRemote.Server.Logging;
+using PCRemote.Server.Licensing;
 
 namespace PCRemote.Server.Network;
 
@@ -597,6 +598,14 @@ public class ClientConnection
                     try
                     {
                         var cfg = ProtocolSerializer.DeserializeScreenConfig(message.Data);
+                        // Server-side enforcement: a Free server clamps the requested quality to the
+                        // free ceiling regardless of what the client asks for (a modified/old app can
+                        // request more, but the server won't honor it). Pro servers honor the full range.
+                        if (LicenseManager.CurrentTier != ServerTier.Pro)
+                        {
+                            ClampConfigToFree(cfg);
+                            Console.WriteLine("[ClientConnection] Free tier - clamped ScreenConfig to free ceiling (H264, <=15Mbps, <=60fps, <=1080p, 8-bit).");
+                        }
                         bool wantHevc = cfg.Codec == ScreenConfigData.CodecHevc &&
                                         (cfg.Capabilities & ScreenConfigData.CapHevc) != 0;
                         int bitDepth = (cfg.BitDepth == 10 && (cfg.Capabilities & ScreenConfigData.CapMain10) != 0) ? 10 : 8;
@@ -652,6 +661,61 @@ public class ClientConnection
         }
     }
     
+    /// <summary>Clamp a client-requested video config down to the free tier ceiling (server-enforced).</summary>
+    private static void ClampConfigToFree(ScreenConfigData cfg)
+    {
+        cfg.Codec = ScreenConfigData.CodecH264;
+        cfg.BitDepth = 8;
+        if (cfg.FpsCap > 60) cfg.FpsCap = 60;
+        if (cfg.BitrateKbps > 15000) cfg.BitrateKbps = 15000;
+        // Cap resolution to 1080p: native and 1440p drop to 1080p.
+        if (cfg.ResolutionMode == ScreenConfigData.ResNative || cfg.ResolutionMode == ScreenConfigData.Res1440)
+            cfg.ResolutionMode = ScreenConfigData.Res1080;
+        // Match-device resolutions above 1080p are pinned to 1080p.
+        if (cfg.ResolutionMode == ScreenConfigData.ResMatchDevice &&
+            (cfg.TargetHeight == 0 || cfg.TargetHeight > 1080))
+        {
+            cfg.TargetWidth = 1920;
+            cfg.TargetHeight = 1080;
+        }
+    }
+
+    /// <summary>Tell the client whether this is a Free or Pro server (plus server/protocol version).</summary>
+    private async Task SendServerInfo()
+    {
+        if (_protocolHandler == null) return;
+        try
+        {
+            var v = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version ?? new Version(0, 0, 0);
+            var info = new ServerInfoData
+            {
+                Tier = LicenseManager.CurrentTier == ServerTier.Pro ? ServerInfoData.TierPro : ServerInfoData.TierFree,
+                VersionMajor = (byte)Math.Clamp(v.Major, 0, 255),
+                VersionMinor = (byte)Math.Clamp(v.Minor, 0, 255),
+                VersionPatch = (byte)Math.Clamp(v.Build < 0 ? 0 : v.Build, 0, 255),
+                ProtocolVersion = 1,
+            };
+            await _protocolHandler.WriteMessageAsync(new ProtocolMessage
+            {
+                Type = MessageType.ServerInfo,
+                Data = ProtocolSerializer.SerializeServerInfo(info)
+            }, CancellationToken.None);
+            Console.WriteLine($"[ClientConnection] Sent ServerInfo (tier={LicenseManager.CurrentTier}).");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[ClientConnection] Error sending server info: {ex.Message}");
+        }
+    }
+
+    /// <summary>Resend ServerInfo to the currently active session (e.g. after a live license activation).</summary>
+    public static void ResendServerInfoToActive()
+    {
+        ClientConnection? active;
+        lock (_sessionLock) { active = _activeConnection; }
+        if (active != null) _ = active.SendServerInfo();
+    }
+
     private async Task SendMonitorInfo()
     {
         try
@@ -841,7 +905,11 @@ public class ClientConnection
 
             // Small delay to ensure client has set up message handlers
             await Task.Delay(100);
-            
+
+            // Tell the client our tier (Free/Pro) so it can gate Pro UI. Sent before MonitorInfo so
+            // the app knows the tier as early as possible.
+            await SendServerInfo();
+
             // Send monitor info so client knows available monitors
             await SendMonitorInfo();
             
