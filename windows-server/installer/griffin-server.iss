@@ -3,7 +3,7 @@
 ;
 ; Design notes:
 ; - Installs PER-USER into %LOCALAPPDATA%\GriffinStream so the server can write its
-;   runtime files (server.pfx, authorized_keys.txt, password.hash) next to the exe
+;   runtime files (server.pfx, authorized_keys.json, etc.) next to the exe
 ;   WITHOUT any code changes and WITHOUT requiring administrator rights.
 ; - The optional Windows Firewall rule is the only step that needs elevation; it is
 ;   launched separately with a UAC prompt so the main install stays non-elevated.
@@ -131,7 +131,9 @@ begin
       mbConfirmation, MB_YESNO) = IDYES then
     begin
       DeleteFile(ExpandConstant('{app}\server.pfx'));
-      DeleteFile(ExpandConstant('{app}\authorized_keys.txt'));
+      DeleteFile(ExpandConstant('{app}\server.pfx.dpapi'));
+      DeleteFile(ExpandConstant('{app}\authorized_keys.json'));
+      DeleteFile(ExpandConstant('{app}\authorized_keys.txt')); // legacy
       DeleteFile(ExpandConstant('{app}\password.hash'));
       // License cache lives in the Roaming profile, not the install folder.
       DelTree(ExpandConstant('{userappdata}\GriffinStream'), True, True, True);

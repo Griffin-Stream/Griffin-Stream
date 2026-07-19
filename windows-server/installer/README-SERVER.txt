@@ -41,9 +41,9 @@ downloads it and installs silently in the background, then relaunches.
 WHERE THINGS ARE
 ----------------
 This app installs per-user under %LOCALAPPDATA%\GriffinStream so it can save its runtime
-files (server.pfx, authorized_keys.txt, password.hash) next to the executable without
+files (server.pfx, authorized_keys.json, etc.) next to the executable without
 requiring administrator rights. Your Pro license (if any) is cached under
-%APPDATA%\GriffinStream.
+%APPDATA%\GriffinStream. Pair phones with the on-screen PIN — no manual key copy.
 
 UNINSTALL
 ---------

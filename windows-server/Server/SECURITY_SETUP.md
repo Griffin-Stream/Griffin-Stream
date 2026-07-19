@@ -1,47 +1,51 @@
 # Security Setup Guide
 
 ## Overview
-The PC Remote Server uses **SSH key-based authentication** for secure access.
+
+Griffin Stream protects the link with **TLS 1.3** and enrolls phones via a **pairing PIN** plus a
+per-device ECDSA identity (generated automatically in the Android app). There is no SSH protocol
+and no manual “copy public key into a text file” step.
 
 ## Certificate
-The server automatically generates a self-signed certificate (`server.pfx`) on first run. This is used for TLS encryption.
 
-**Note**: For production use, replace this with a proper certificate from a Certificate Authority.
+The server automatically generates a self-signed certificate (`server.pfx`) on first run for TLS.
 
-## Authentication Setup
+**Note:** For production deployments you may replace this with a certificate from a Certificate Authority.
 
-### Key-Based Authentication (Required)
+## Pairing (required once per phone)
 
-1. **Get your public key from the Android app:**
-   - The app generates an EC (Elliptic Curve) key pair automatically
-   - The public key is stored in the app's encrypted preferences
-   - Tap the copy icon next to "SSH Key Ready" to copy your public key
+1. Start **Griffin Stream Server** on the PC — the dashboard shows a **pairing PIN** and local IP.
+2. On the phone (same LAN), enter the PC’s IP (port `8888` by default) and tap **Connect**.
+3. When prompted, type the PIN from the server window.
+4. The phone’s device identity is enrolled on the PC. Later connects prove that identity — no PIN
+   unless you reset the phone’s identity or wipe paired devices on the PC.
 
-2. **Add the public key to `authorized_keys.txt`:**
-   - Create `authorized_keys.txt` in the Server directory
-   - Add one public key per line (base64 encoded)
-   - Example:
-     ```
-     MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE...
-     ```
+## File locations (install folder)
 
-3. **In your Android app**, connect using the server address and port. The app will automatically use key-based authentication.
+Typical path: `%LOCALAPPDATA%\GriffinStream`
 
-## File Locations
-All security files should be in the `windows-server/Server` directory:
-- `server.pfx` - Server certificate (auto-generated)
-- `authorized_keys.txt` - Public keys (required for authentication)
+| File | Purpose |
+|------|---------|
+| `server.pfx` | TLS certificate (auto-generated) |
+| `server.pfx.dpapi` | DPAPI-protected PFX password |
+| `authorized_keys.json` | Enrolled device identities (created/updated by PIN pairing) |
 
-## Security Best Practices
-1. Store `authorized_keys.txt` securely
-2. Don't commit security files to version control
-3. For production, use a proper SSL certificate
-4. Prefer same-LAN pairing; do not expose TCP port 8888 to the public internet
-5. Enable Windows Firewall rules for port 8888
-6. Only add trusted public keys to `authorized_keys.txt`
+The legacy line-based `authorized_keys.txt` is **not used**.
+
+## Security best practices
+
+1. Prefer same-LAN pairing; do **not** expose TCP port 8888 to the public internet.
+2. Don’t commit security files (`server.pfx`, `authorized_keys.json`, license data) to version control.
+3. Enable Windows Firewall rules for port 8888 (installer can add this optionally).
+4. Revoke phones you no longer trust from the server’s paired-devices list (or by wiping
+   `authorized_keys.json` and re-pairing).
+5. On the phone, **Advanced options → Reset device identity** only if you need a fresh identity
+   (you will pair again with the PIN).
 
 ## Troubleshooting
-- **Certificate issues**: Delete `server.pfx` and restart server to regenerate
-- **Authentication fails**: Check that keys are correctly formatted (base64) and match the public key from the app
-- **Connection refused**: Check firewall settings for port 8888
-- **Key not found**: Ensure `authorized_keys.txt` exists and contains the correct public key from your Android app
+
+- **Certificate / “identity changed”:** Server was reinstalled or `server.pfx` was regenerated —
+  enter the pairing PIN when the app prompts.
+- **Authentication failed:** Reconnect and enter the current PIN from the server window (PIN
+  refreshes when the server restarts until the device is enrolled).
+- **Connection refused:** Confirm the server is running and firewall allows port 8888.

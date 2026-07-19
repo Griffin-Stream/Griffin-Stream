@@ -6,6 +6,8 @@
 *.jks
 *.keystore
 authorized_keys.txt
+authorized_keys.json
+server.pfx.dpapi
 password.hash
 *.env
 secrets*
