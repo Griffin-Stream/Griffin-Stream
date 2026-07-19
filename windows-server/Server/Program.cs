@@ -23,6 +23,10 @@ class Program
     private static int _activeClients;
     private const int MaxConcurrentClients = 8;
 
+    // Held for the process lifetime so Inno AppMutex=GriffinStreamServer can wait for a clean exit
+    // during silent in-app updates. Must not be GC'd.
+    private static Mutex? _appMutex;
+
     // DPI Awareness constants and imports
     [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
     private static extern bool SetProcessDpiAwarenessContext(int dpiContext);
@@ -36,6 +40,21 @@ class Program
         // "Show debug log" toggle can attach a terminal and replay history on demand. This
         // must run before the first Console.WriteLine so nothing is missed.
         ConsoleTee.Install();
+
+        // Single-instance mutex (matches installer AppMutex). A second launch exits quietly.
+        try
+        {
+            _appMutex = new Mutex(true, @"Local\" + Updater.AppMutexName, out bool createdNew);
+            if (!createdNew)
+            {
+                Console.WriteLine("Griffin Stream Server is already running.");
+                return;
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[System] Mutex unavailable: {ex.Message}");
+        }
 
         Console.WriteLine("PC Remote Server Starting...");
         Console.WriteLine("Press Ctrl+C to stop the server.");
@@ -129,7 +148,7 @@ class Program
 
 
         
-        // Display connection information
+        // Display LAN connection information only (no tunnel / VPN product guidance).
         _ = Task.Run(async () =>
         {
             try
@@ -150,18 +169,6 @@ class Program
                 Console.WriteLine($"--------------------------------");
                 Console.WriteLine($"Pairing PIN (enter in the app to add a new device): {securityManager.PairingPin}");
                 Console.WriteLine($"================================\n");
-                
-                // Check for ngrok tunnel
-                var ngrokAddress = await TunnelHelper.GetNgrokTunnelAddress(port);
-                if (ngrokAddress != null)
-                {
-                    Console.WriteLine($"\n✓ ngrok tunnel detected!");
-                    Console.WriteLine($"  Connect using: {ngrokAddress}");
-                    Console.WriteLine();
-                }
-                
-                // Print tunnel instructions (for users without router access)
-                TunnelHelper.PrintTunnelInstructions(port);
             }
             catch
             {

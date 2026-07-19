@@ -36,7 +36,7 @@ All security files should be in the `windows-server/Server` directory:
 1. Store `authorized_keys.txt` securely
 2. Don't commit security files to version control
 3. For production, use a proper SSL certificate
-4. Consider using a VPN (like Tailscale) for additional security
+4. Prefer same-LAN pairing; do not expose TCP port 8888 to the public internet
 5. Enable Windows Firewall rules for port 8888
 6. Only add trusted public keys to `authorized_keys.txt`
 

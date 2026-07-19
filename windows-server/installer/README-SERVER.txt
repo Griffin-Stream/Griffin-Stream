@@ -4,12 +4,15 @@ Griffin Stream Server
 This is the Windows server for the Griffin Stream Android app. It streams your desktop
 and accepts mouse/keyboard/gamepad input from the app over an encrypted (TLS) connection.
 
-QUICK START
------------
+QUICK START (SAME NETWORK)
+--------------------------
 1. Run "Server.exe" (or the Start Menu shortcut "Griffin Stream Server").
 2. On first run the server generates a TLS certificate (server.pfx) automatically.
-3. In the Android app, copy your public key and add it to authorized_keys.txt in this
-   folder (see SECURITY_SETUP for details), then connect to this PC's IP on port 8888.
+3. Note the local IP and pairing PIN shown in the server window.
+4. On your phone/tablet (same Wi-Fi / LAN as this PC), open Griffin Stream, enter the
+   PIN when prompted, and connect using this PC's local IP on port 8888.
+
+Do not expose port 8888 to the public internet.
 
 GAMEPAD SUPPORT (OPTIONAL)
 --------------------------
@@ -32,8 +35,8 @@ hide it. A rolling log is also written to %LOCALAPPDATA%\GriffinStream\logs rega
 
 UPDATES
 -------
-Click "Check for updates" in the server window. The server checks the official GitHub release
-and, if a newer build is available, offers to download and run the installer for you.
+Click "Check for updates" in the server window. When a newer build is available, the server
+downloads it and installs silently in the background, then relaunches.
 
 WHERE THINGS ARE
 ----------------

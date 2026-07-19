@@ -7,6 +7,8 @@
 ;   WITHOUT any code changes and WITHOUT requiring administrator rights.
 ; - The optional Windows Firewall rule is the only step that needs elevation; it is
 ;   launched separately with a UAC prompt so the main install stays non-elevated.
+; - In-app updates launch this Setup with /VERYSILENT; AppMutex + CloseApplications
+;   coordinate a clean replace without force-close dialogs when the app exits first.
 
 #define AppName "Griffin Stream Server"
 #define AppPublisher "Griffin Stream"
@@ -58,6 +60,10 @@ UninstallDisplayIcon={app}\griffin.ico
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0
+; Match Mutex created in Server Program.cs.
+AppMutex=Local\GriffinStreamServer
+CloseApplications=yes
+RestartApplications=no
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -75,7 +81,8 @@ Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs 
 Source: "griffin.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "firewall-allow.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "firewall-remove.ps1"; DestDir: "{app}"; Flags: ignoreversion
-Source: "README-SERVER.txt"; DestDir: "{app}"; Flags: ignoreversion isreadme
+; Install README but do not auto-open (no isreadme — that defaults the Finished checkbox on).
+Source: "README-SERVER.txt"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\Griffin Stream Server"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\griffin.ico"
@@ -93,6 +100,9 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 Filename: "powershell.exe"; \
   Parameters: "-ExecutionPolicy Bypass -Command ""Start-Process powershell -Verb RunAs -ArgumentList '-ExecutionPolicy Bypass -NoProfile -File \""{app}\firewall-allow.ps1\""'"""; \
   Flags: runhidden postinstall; Tasks: firewall; Description: "Add Windows Firewall rule"
+; Optional README open — unchecked by default (first-time users are not pushed into Notepad).
+Filename: "{app}\README-SERVER.txt"; Description: "View README (optional)"; \
+  Flags: postinstall shellexec skipifsilent skipifdoesntexist unchecked
 Filename: "{app}\{#AppExeName}"; Description: "Launch Griffin Stream Server now"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
@@ -109,20 +119,6 @@ Type: files; Name: "{app}\crash_log.txt"
 Type: dirifempty; Name: "{app}"
 
 [Code]
-procedure CurStepChanged(CurStep: TSetupStep);
-begin
-  if CurStep = ssPostInstall then
-  begin
-    MsgBox(
-      'Griffin Stream Server installed.' + #13#10#13#10 +
-      'Gamepad support requires the ViGEmBus driver, which is NOT bundled.' + #13#10 +
-      'If you need virtual gamepad input, install it from:' + #13#10 +
-      'https://github.com/nefarius/ViGEmBus/releases' + #13#10#13#10 +
-      'See README-SERVER.txt in the install folder for setup details.',
-      mbInformation, MB_OK);
-  end;
-end;
-
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   // Offer a full clean wipe. The ViGEmBus gamepad driver is a separate, shared kernel driver we

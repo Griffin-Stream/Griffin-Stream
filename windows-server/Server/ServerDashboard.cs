@@ -32,6 +32,7 @@ public static class ServerDashboard
 
     private static Button? _debugButton;
     private static Button? _updateButton;
+    private static Label? _versionLabel;
 
     // Paragraph labels whose wrap width tracks the (resizable) window width.
     private static Label? _instructions;
@@ -111,9 +112,10 @@ public static class ServerDashboard
 
     private static DashboardForm BuildForm(string pin, int port)
     {
+        var version = Updater.DisplayVersion;
         var form = new DashboardForm
         {
-            Text = "Griffin Stream Server",
+            Text = $"Griffin Stream Server {version}",
             BackColor = Bg,
             ForeColor = TextPrimary,
             FormBorderStyle = FormBorderStyle.None,
@@ -396,6 +398,16 @@ public static class ServerDashboard
         _updateButton = MakeSecondaryButton("Check for updates");
         _updateButton.Click += OnUpdateClicked;
 
+        _versionLabel = new Label
+        {
+            Text = $"v{Updater.DisplayVersion}",
+            AutoSize = true,
+            ForeColor = TextMuted,
+            Font = new Font("Segoe UI", 8.5f),
+            Margin = new Padding(8, 10, 0, 0),
+            BackColor = Color.Transparent
+        };
+
         var footer = new FlowLayoutPanel
         {
             FlowDirection = FlowDirection.LeftToRight, WrapContents = true, AutoSize = true,
@@ -403,6 +415,7 @@ public static class ServerDashboard
         };
         footer.Controls.Add(_debugButton);
         footer.Controls.Add(_updateButton);
+        footer.Controls.Add(_versionLabel);
         return footer;
     }
 
@@ -503,15 +516,30 @@ public static class ServerDashboard
         {
             button.Enabled = false;
             button.Text = "Downloading…";
-            bool started = await Updater.DownloadAndRunAsync(known);
+            var progress = new Progress<double>(p =>
+            {
+                var btn = _updateButton;
+                if (btn == null || btn.IsDisposed) return;
+                void Apply() => btn.Text = $"Downloading… {(int)(p * 100)}%";
+                try
+                {
+                    if (_form != null && _form.InvokeRequired) _form.BeginInvoke((Action)Apply);
+                    else Apply();
+                }
+                catch { /* ignore */ }
+            });
+            bool started = await Updater.DownloadAndRunAsync(known, progress);
             if (started)
             {
-                button.Text = "Installing…";
-                MessageBox.Show("The installer is launching. The server will now close so it can update.",
-                    "Griffin Stream Server", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                // Helper waits for exit, runs silent Setup, relaunches — no MessageBox.
+                button.Text = "Restarting…";
                 Environment.Exit(0);
             }
-            else { button.Enabled = true; button.Text = "Retry update"; }
+            else
+            {
+                button.Enabled = true;
+                button.Text = "Retry update";
+            }
             return;
         }
 
