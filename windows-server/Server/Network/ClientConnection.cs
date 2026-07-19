@@ -121,8 +121,20 @@ public class ClientConnection
             throw;
         }
 
-        // Start screen capture streaming (only after authentication)
-        // Don't start it here - wait until authenticated
+        // Drop peers that complete TLS but never finish ECDSA auth (resource / DoS guard).
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(TimeSpan.FromSeconds(15), _cancellationToken);
+                if (!_authenticated && _client.Connected)
+                {
+                    Console.WriteLine("[ClientConnection] Authentication timed out; closing connection.");
+                    try { _client.Close(); } catch { /* ignore */ }
+                }
+            }
+            catch (OperationCanceledException) { /* session ended */ }
+        });
 
         try
         {
@@ -499,43 +511,65 @@ public class ClientConnection
         }
     }
 
+    // Pre-auth abuse: close the socket after too many non-auth messages.
+    private int _preAuthViolations;
+    private const int MaxPreAuthViolations = 8;
+
+    // WOL rate limit (per connection) — prevents magic-packet spam from a paired device.
+    private DateTime _lastWolUtc = DateTime.MinValue;
+    private static readonly TimeSpan WolMinInterval = TimeSpan.FromSeconds(5);
+
     private async Task HandleMessage(ProtocolMessage message)
     {
+        // Handshake-only allowlist before authentication. Everything else (including screen
+        // config, bitrate, WOL, heartbeats) requires a completed ECDSA challenge-response.
         switch (message.Type)
         {
             case MessageType.AuthRequest:
                 await HandleAuthRequest(message);
-                break;
+                return;
             case MessageType.AuthResponse:
                 await HandleAuthResponse(message);
-                break;
+                return;
+        }
+
+        if (!_authenticated)
+        {
+            _preAuthViolations++;
+            Console.WriteLine($"[ClientConnection] Ignoring {message.Type} before authentication (violation {_preAuthViolations}/{MaxPreAuthViolations}).");
+            if (_preAuthViolations >= MaxPreAuthViolations)
+            {
+                Console.WriteLine("[ClientConnection] Too many pre-auth messages; closing connection.");
+                try { _client.Close(); } catch { /* ignore */ }
+            }
+            return;
+        }
+
+        switch (message.Type)
+        {
             case MessageType.Unpair:
                 await HandleUnpair();
                 break;
             case MessageType.MouseInput:
-                if (_authenticated)
                 {
                     var (monitorLeft, monitorTop) = _screenCapture.GetCurrentMonitorOffset();
                     _inputHandler.HandleMouseInput(message.Data ?? Array.Empty<byte>(), monitorLeft, monitorTop);
                 }
                 break;
             case MessageType.KeyboardInput:
-                if (_authenticated)
-                    _inputHandler.HandleKeyboardInput(message.Data ?? Array.Empty<byte>());
+                _inputHandler.HandleKeyboardInput(message.Data ?? Array.Empty<byte>());
                 break;
             case MessageType.GamepadInput:
-                if (_authenticated)
-                    _inputHandler.HandleGamepadInput(message.Data ?? Array.Empty<byte>());
+                _inputHandler.HandleGamepadInput(message.Data ?? Array.Empty<byte>());
                 break;
             case MessageType.TextInput:
-                if (_authenticated && message.Data != null)
+                if (message.Data != null)
                 {
                     var text = ProtocolSerializer.DeserializeTextInput(message.Data);
                     _inputHandler.HandleTextInput(text);
                 }
                 break;
             case MessageType.Heartbeat:
-                // Respond to heartbeat
                 if (_protocolHandler != null)
                 {
                     await _protocolHandler.WriteMessageAsync(new ProtocolMessage
@@ -545,20 +579,23 @@ public class ClientConnection
                 }
                 break;
             case MessageType.WOLRequest:
-                // Handle Wake-on-LAN request (no authentication required - allows waking PC when off)
+                // Auth required: server must already be reachable, so this wakes another host
+                // (or a MAC the user saved) from a paired device — not an unauthenticated LAN open.
                 if (message.Data != null && message.Data.Length > 0)
                 {
+                    var now = DateTime.UtcNow;
+                    if (now - _lastWolUtc < WolMinInterval)
+                    {
+                        Console.WriteLine("[ClientConnection] WOL rate-limited; ignoring.");
+                        break;
+                    }
+                    _lastWolUtc = now;
                     var macAddress = System.Text.Encoding.UTF8.GetString(message.Data);
                     Console.WriteLine($"[ClientConnection] Received WOL request for MAC: {macAddress}");
                     var success = WOLHelper.SendMagicPacket(macAddress);
-                    if (success)
-                    {
-                        Console.WriteLine($"[ClientConnection] Successfully sent WOL packet for {macAddress}");
-                    }
-                    else
-                    {
-                        Console.WriteLine($"[ClientConnection] Failed to send WOL packet for {macAddress}");
-                    }
+                    Console.WriteLine(success
+                        ? $"[ClientConnection] Successfully sent WOL packet for {macAddress}"
+                        : $"[ClientConnection] Failed to send WOL packet for {macAddress}");
                 }
                 break;
             case MessageType.QualityChange:

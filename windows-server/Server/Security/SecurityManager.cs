@@ -354,10 +354,14 @@ public class SecurityManager
     // ---- Server certificate ---------------------------------------------------------------
 
     private static readonly string CertPath = Path.Combine(AppContext.BaseDirectory, "server.pfx");
-    private const string CertPassword = "password";
+    // DPAPI-protected password for server.pfx (CurrentUser scope). Not the cert itself —
+    // migrating existing installs keeps the same public cert so Android TOFU pins stay valid.
+    private static readonly string CertPasswordPath = Path.Combine(AppContext.BaseDirectory, "server.pfx.dpapi");
+    private const string LegacyCertPassword = "password";
 
-    private const X509KeyStorageFlags CertFlags =
-        X509KeyStorageFlags.PersistKeySet | X509KeyStorageFlags.Exportable;
+    // PersistKeySet keeps the private key usable by SslStream; avoid Exportable so the key
+    // is harder to extract from the machine store after import.
+    private const X509KeyStorageFlags CertFlags = X509KeyStorageFlags.PersistKeySet;
 
     private X509Certificate2 LoadOrCreateCertificate()
     {
@@ -365,7 +369,8 @@ public class SecurityManager
         {
             if (File.Exists(CertPath))
             {
-                var cert = new X509Certificate2(CertPath, CertPassword, CertFlags);
+                var password = ResolveCertPassword(migrateLegacy: true);
+                var cert = new X509Certificate2(CertPath, password, CertFlags);
                 if (cert.HasPrivateKey)
                 {
                     return cert;
@@ -379,6 +384,66 @@ public class SecurityManager
         }
 
         return CreateSelfSignedCertificate();
+    }
+
+    /// <summary>
+    /// Load the PFX password from DPAPI storage, or migrate a legacy install that used the
+    /// hardcoded password by re-exporting the same cert under a random DPAPI-protected password.
+    /// </summary>
+    private static string ResolveCertPassword(bool migrateLegacy)
+    {
+        if (File.Exists(CertPasswordPath))
+        {
+            try
+            {
+                var protectedBytes = File.ReadAllBytes(CertPasswordPath);
+                var plain = ProtectedData.Unprotect(protectedBytes, optionalEntropy: null, DataProtectionScope.CurrentUser);
+                return Encoding.UTF8.GetString(plain);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[Auth] Could not read DPAPI cert password: {ex.Message}");
+            }
+        }
+
+        if (!migrateLegacy || !File.Exists(CertPath))
+        {
+            return CreateAndStoreCertPassword();
+        }
+
+        // Legacy: PFX encrypted with the old fixed password. Re-wrap under a random password
+        // without changing the certificate identity (keeps client pins valid).
+        try
+        {
+            using var legacy = new X509Certificate2(CertPath, LegacyCertPassword,
+                X509KeyStorageFlags.PersistKeySet | X509KeyStorageFlags.Exportable);
+            if (!legacy.HasPrivateKey)
+                throw new InvalidOperationException("Legacy PFX has no private key.");
+
+            var newPassword = CreateAndStoreCertPassword();
+            var pfxBytes = legacy.Export(X509ContentType.Pkcs12, newPassword);
+            File.WriteAllBytes(CertPath, pfxBytes);
+            LockDownFile(CertPath);
+            Console.WriteLine("[Auth] Migrated server.pfx to a DPAPI-protected random password (cert identity unchanged).");
+            return newPassword;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Auth] Legacy PFX migration failed: {ex.Message}");
+            throw;
+        }
+    }
+
+    private static string CreateAndStoreCertPassword()
+    {
+        var password = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32));
+        var protectedBytes = ProtectedData.Protect(
+            Encoding.UTF8.GetBytes(password),
+            optionalEntropy: null,
+            DataProtectionScope.CurrentUser);
+        File.WriteAllBytes(CertPasswordPath, protectedBytes);
+        LockDownFile(CertPasswordPath);
+        return password;
     }
 
     private X509Certificate2 CreateSelfSignedCertificate()
@@ -399,16 +464,19 @@ public class SecurityManager
             DateTimeOffset.UtcNow.AddDays(-1),
             DateTimeOffset.UtcNow.AddYears(1));
 
-        var pfxBytes = ephemeral.Export(X509ContentType.Pkcs12, CertPassword);
+        var password = CreateAndStoreCertPassword();
+        // Export requires an exportable ephemeral; the persisted load uses non-Exportable flags.
+        var pfxBytes = ephemeral.Export(X509ContentType.Pkcs12, password);
         try
         {
             File.WriteAllBytes(CertPath, pfxBytes);
+            LockDownFile(CertPath);
         }
         catch (Exception ex)
         {
             Console.WriteLine($"WARNING: could not persist server certificate to {CertPath}: {ex.Message}");
         }
 
-        return new X509Certificate2(pfxBytes, CertPassword, CertFlags);
+        return new X509Certificate2(pfxBytes, password, CertFlags);
     }
 }

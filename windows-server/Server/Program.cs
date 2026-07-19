@@ -18,6 +18,11 @@ class Program
     private static readonly CancellationTokenSource _cancellationTokenSource = new();
     private static int _shutdownRequested = 0; // For atomic check
 
+    // Cap concurrent TCP clients (includes in-flight TLS/auth handshakes). Streaming is still
+    // single-active ("newest wins"); this only limits resource use from connection floods.
+    private static int _activeClients;
+    private const int MaxConcurrentClients = 8;
+
     // DPI Awareness constants and imports
     [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
     private static extern bool SetProcessDpiAwarenessContext(int dpiContext);
@@ -262,7 +267,26 @@ class Program
                     client.Close();
                     break;
                 }
-                _ = Task.Run(() => HandleClient(client, screenCapture, inputHandler, securityManager, audioCapture));
+
+                if (Volatile.Read(ref _activeClients) >= MaxConcurrentClients)
+                {
+                    Console.WriteLine($"[Server] Rejecting client — already at {MaxConcurrentClients} concurrent connections.");
+                    client.Close();
+                    continue;
+                }
+
+                Interlocked.Increment(ref _activeClients);
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await HandleClient(client, screenCapture, inputHandler, securityManager, audioCapture);
+                    }
+                    finally
+                    {
+                        Interlocked.Decrement(ref _activeClients);
+                    }
+                });
             }
             catch (ObjectDisposedException)
             {
