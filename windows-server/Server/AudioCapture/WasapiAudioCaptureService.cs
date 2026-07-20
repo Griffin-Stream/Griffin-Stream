@@ -174,28 +174,43 @@ public class WasapiAudioCaptureService : IDisposable
         return null;
     }
 
+    /// <summary>
+    /// Tear down and recreate WASAPI loopback so a stalled idle session does not survive reconnect.
+    /// </summary>
     public void ForceRestart()
     {
+        if (_disposed) return;
+
         Console.WriteLine("[WASAPI] Force restart requested...");
-        // Re-init handled by caller usually via disposal/new, but here we can just ensure it's running
-        if (!_initialized) Initialize();
+        StopCapture();
+        Initialize();
+    }
+
+    /// <summary>
+    /// Stop capture and clear buffers without marking the service disposed (safe to Initialize again).
+    /// </summary>
+    public void StopCapture()
+    {
+        lock (_lock)
+        {
+            if (_capture != null)
+            {
+                try { _capture.DataAvailable -= OnDataAvailable; } catch { }
+                try { _capture.StopRecording(); } catch { }
+                try { _capture.Dispose(); } catch { }
+                _capture = null;
+            }
+
+            _currentFrameOffset = 0;
+            while (_audioFrames.TryDequeue(out _)) { }
+            _initialized = false;
+        }
     }
 
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
-
-        lock (_lock)
-        {
-            try
-            {
-                _capture?.StopRecording();
-                _capture?.Dispose();
-            }
-            catch { }
-            
-            _capture = null;
-        }
+        StopCapture();
     }
 }

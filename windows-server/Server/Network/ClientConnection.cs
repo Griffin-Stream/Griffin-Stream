@@ -518,6 +518,8 @@ public class ClientConnection
     // WOL rate limit (per connection) — prevents magic-packet spam from a paired device.
     private DateTime _lastWolUtc = DateTime.MinValue;
     private static readonly TimeSpan WolMinInterval = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan KeyframeMinInterval = TimeSpan.FromMilliseconds(750);
+    private DateTime _lastKeyframeRequestUtc = DateTime.MinValue;
 
     private async Task HandleMessage(ProtocolMessage message)
     {
@@ -576,6 +578,22 @@ public class ClientConnection
                     {
                         Type = MessageType.HeartbeatResponse
                     }, CancellationToken.None);
+                }
+                break;
+            case MessageType.ScreenFrameRequest:
+                // Client decoder was recreated (Settings, surface destroy, reconnect). Restart
+                // the encoder so the next frames begin with an IDR instead of orphaned P-frames.
+                {
+                    var nowKf = DateTime.UtcNow;
+                    if (nowKf - _lastKeyframeRequestUtc < KeyframeMinInterval)
+                    {
+                        Console.WriteLine("[ClientConnection] Keyframe request rate-limited; ignoring.");
+                        break;
+                    }
+                    _lastKeyframeRequestUtc = nowKf;
+                    Console.WriteLine("[ClientConnection] Client requested keyframe — restarting encoder.");
+                    try { _screenCapture.RestartEncoder(); }
+                    catch (Exception ex) { Console.WriteLine($"[ClientConnection] Keyframe restart failed: {ex.Message}"); }
                 }
                 break;
             case MessageType.WOLRequest:
